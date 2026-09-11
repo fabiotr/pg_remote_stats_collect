@@ -1,0 +1,100 @@
+# Single source of truth for every environment-specific value used
+# across 01_remote_setup.sql .. 07_delete_collection.sql, consumed
+# directly by deploy.py. Copy this file to config.yaml and edit it for
+# your own topology.
+
+schema: stats_collect
+owner_role: stats_collect_owner   # NOLOGIN, owns the schema and every object in it
+
+# .pg_service.conf name of the central database that steps 02-07 run
+# against and that ends up holding all the history.
+central_service: central
+
+# One entry per row in stats_collect.instance_config and per value in
+# the instance_name enum (both must list exactly these instance names).
+#
+# cluster: the instance's own name if it's a writer, or its writer's
+# name if it's a reader -- a writer always has cluster == name, so
+# there's no separate is-writer flag. This is the grouping key deploy.py
+# uses to decide how many times to run 01_remote_setup.sql (once per
+# distinct cluster value, against "service=<cluster value>") and which
+# password to generate for each.
+# instance_type: Writer, Reader or Other -- purely descriptive.
+# sys_prefix: groups instances expected to share the same objects
+# (schemas, tables, ...), independent of cluster/region.
+# pg_version: that instance's actual PostgreSQL server version (SHOW
+# server_version) -- always quote it (e.g. "17.10"), so YAML doesn't
+# parse it as a float and silently drop a trailing zero. Not read by
+# anything here yet; see the README's version-support caveat.
+# notes: optional free text, persisted to instance_config.notes as-is.
+instances:
+  - name: main
+    fdw_server: fdw_main
+    host: main.example.rds.amazonaws.com
+    port: 5432
+    database_name: appdb
+    remote_user: stats_collect_main
+    cluster: main
+    instance_type: Writer
+    sys_prefix: app
+    pg_version: "17.4"
+    enabled: true
+    notes: writer of the main cluster, shared with main_replica1/2
+
+  - name: main_replica1
+    fdw_server: fdw_main_replica1
+    host: main-replica1.example.rds.amazonaws.com
+    port: 5432
+    database_name: appdb
+    remote_user: stats_collect_main
+    cluster: main
+    instance_type: Reader
+    sys_prefix: app
+    pg_version: "17.4"
+    enabled: true
+
+  - name: main_replica2
+    fdw_server: fdw_main_replica2
+    host: main-replica2.example.rds.amazonaws.com
+    port: 5432
+    database_name: appdb
+    remote_user: stats_collect_main
+    cluster: main
+    instance_type: Reader
+    sys_prefix: app
+    pg_version: "17.4"
+    enabled: true
+
+  - name: secondary
+    fdw_server: fdw_secondary
+    host: secondary.example.rds.amazonaws.com
+    port: 5432
+    database_name: appdb
+    remote_user: stats_collect_secondary
+    cluster: secondary
+    instance_type: Writer
+    sys_prefix: app
+    pg_version: "17.4"
+    enabled: true
+    notes: standalone cluster, no reader endpoint
+
+  - name: archive
+    fdw_server: fdw_archive
+    host: archive.example.rds.amazonaws.com
+    port: 5432
+    database_name: archivedb
+    remote_user: stats_collect_archive
+    cluster: archive
+    instance_type: Writer
+    sys_prefix: archive
+    pg_version: "16.4"
+    enabled: true
+    notes: separate system -- different sys_prefix and pg_version on purpose, to show both fields in use
+
+job:
+  name: stats-collect-monthly
+  schedule: "0 5 1 * *"       # 1st of every month, 05:00 UTC
+  command: "CALL stats_collect.collect_stats();"
+  scheduled_in: postgres       # pg_cron metadata database (AWS RDS/Aurora requirement)
+  runs_in: appdb               # actual target database (via UPDATE cron.job)
+  run_as: stats_collect_owner
