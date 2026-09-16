@@ -373,7 +373,7 @@ ORDER BY p.instance, p.grp, p.index_size DESC;
 -- indexname pair is excluded until it reappears: you can't claim
 -- "unused everywhere" without data from everywhere.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE VIEW rpt_never_used_everywhere AS
+CREATE OR REPLACE VIEW rpt_index_never_used_everywhere AS
 WITH latest_job AS (
     SELECT max(id) AS id FROM stat_collect_job
 ),

@@ -90,7 +90,7 @@ Read replicas of the same cluster share the writer's catalog and reject write st
 | `rpt_latest_snapshot` | synthetic | latest-job health snapshot per instance |
 | `rpt_top_queries_latest` | synthetic | top 10 queries by total execution time, latest job per instance |
 | `rpt_index_poor_latest` | synthetic | problematic indexes, latest job per instance |
-| `rpt_never_used_everywhere` | synthetic | indexes flagged "Never Used" in **every** enabled instance simultaneously, in the most recent job overall — strong drop candidates |
+| `rpt_index_never_used_everywhere` | synthetic | indexes flagged "Never Used" in **every** enabled instance simultaneously, in the most recent job overall — strong drop candidates |
 
 ## Setup order (manual, if not using `deploy.py`)
 
