@@ -33,12 +33,27 @@ Usage:
     table, not config.yaml; prints commands for you to review and run.
 
     ./deploy.py --update [config.yaml]
-    Already-deployed environment: diffs config.yaml against the live
-    instance_config and actually runs whatever's needed to add what's
-    missing -- a fresh remote role for a brand-new cluster, or a
-    password reset (+ resynced sibling USER MAPPINGs) for an instance
-    joining a cluster that's already deployed. Nothing already in
-    instance_config is touched.
+    Already-deployed environment: reconciles it with config.yaml, in
+    three passes -- add, remove, update -- each a no-op if there's
+    nothing for it to do:
+      - Removed from config.yaml: FDW objects dropped (DROP SERVER
+        CASCADE, taking the USER MAPPING and 7 foreign tables with it),
+        instance_config row deleted, and -- if that was the last
+        instance on its cluster -- the remote role too (best-effort:
+        a warning is printed and the run continues if it still owns
+        other objects there).
+      - Present in both but changed: instance_config updated to match,
+        and if fdw_server/host/port/database_name/remote_user changed,
+        the FOREIGN SERVER/USER MAPPING updated too. Passwords aren't
+        touched by this path.
+      - New in config.yaml: a fresh remote role for a brand-new
+        cluster, or (joining a cluster that's already deployed) a
+        password reset for that cluster's role with every existing
+        sibling instance's USER MAPPING resynced, since the password
+        was never stored from the original deploy.
+    Known edge case: removing every instance of a cluster while also
+    adding a new one that reuses that same cluster name, in the same
+    run, isn't handled -- split it into two separate --update runs.
 
 Requires: psql on PATH, PyYAML (`pip install pyyaml`).
 
@@ -84,6 +99,14 @@ def run_psql_file(conn: str, path: str, variables: dict[str, str] | None = None)
 
 def run_psql_command(conn: str, command: str) -> None:
     run(["psql", conn, "-X", "-v", "ON_ERROR_STOP=1", "-c", command])
+
+
+def run_psql_command_allow_fail(conn: str, command: str) -> bool:
+    """Like run_psql_command, but returns False instead of exiting --
+    for steps allowed to fail without aborting the rest of the run
+    (e.g. dropping a remote role that still owns other objects)."""
+    result = subprocess.run(["psql", conn, "-X", "-v", "ON_ERROR_STOP=1", "-c", command])
+    return result.returncode == 0
 
 
 def run_psql_query(conn: str, query: str) -> str:
@@ -138,6 +161,58 @@ def instance_config_values(inst: dict) -> str:
 INSTANCE_CONFIG_COLUMNS = (
     "instance, fdw_server, host, port, database_name, remote_user, cluster, instance_type, sys_prefix, pg_version, notes"
 )
+
+# Columns compared/read for --update's reconciliation (instance itself
+# is split out as the dict key -- see parse_live_instance_config).
+LIVE_INSTANCE_COLUMNS = (
+    "fdw_server", "host", "port", "database_name", "remote_user",
+    "cluster", "instance_type", "sys_prefix", "pg_version", "enabled", "notes",
+)
+
+# Which of the columns above affect the FDW objects (FOREIGN SERVER /
+# USER MAPPING), as opposed to being instance_config-only metadata.
+FDW_RELEVANT_COLUMNS = ("fdw_server", "host", "port", "database_name", "remote_user")
+
+
+def parse_live_instance_config(central_conn: str) -> dict[str, dict[str, str]]:
+    """{instance: {column: value}} for every row in instance_config,
+    values as plain strings exactly as psql prints them -- compare
+    with instance_yaml_value() rather than assuming a type."""
+    raw = run_psql_query(
+        central_conn,
+        "SELECT instance || '|' || " + " || '|' || ".join(LIVE_INSTANCE_COLUMNS).replace(
+            "notes", "coalesce(notes, '')"
+        ) + " FROM stats_collect.instance_config ORDER BY instance;",
+    )
+    live: dict[str, dict[str, str]] = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|", len(LIVE_INSTANCE_COLUMNS))
+        live[parts[0]] = dict(zip(LIVE_INSTANCE_COLUMNS, parts[1:]))
+    return live
+
+
+def instance_yaml_value(inst: dict, column: str) -> str:
+    """Renders one instances[] entry's value the same way
+    parse_live_instance_config renders the database's, so the two can
+    be compared directly as strings."""
+    if column == "enabled":
+        # A boolean concatenated with "||" casts to 'true'/'false', not
+        # psql's usual single-column 't'/'f' display.
+        return "true" if inst.get("enabled", True) else "false"
+    if column == "notes":
+        return inst.get("notes") or ""
+    if column in ("port", "pg_version"):
+        return str(inst[column])
+    return inst[column]
+
+
+def instance_matches_live(inst: dict, live_row: dict[str, str]) -> bool:
+    return all(
+        instance_yaml_value(inst, column) == live_row[column]
+        for column in LIVE_INSTANCE_COLUMNS
+    )
 
 
 def generate_setup_calls(central_conn: str) -> None:
@@ -210,15 +285,9 @@ def generate_setup_calls(central_conn: str) -> None:
 
 
 def update_deploy(config_path: Path, cfg: dict) -> None:
-    """--update: adds to an already-deployed environment whatever
-    instances are in config.yaml but missing from the live
-    instance_config; nothing already deployed is touched otherwise.
-
-    A new instance on a brand-new cluster gets a fresh remote role. A
-    new instance joining an already-deployed cluster gets that
-    cluster's role password reset (never stored from the original
-    deploy) with every existing sibling instance's USER MAPPING updated
-    to match, so nothing already working breaks.
+    """--update: reconciles an already-deployed environment with
+    config.yaml -- see the module docstring for the three passes
+    (remove/update/add) and the one known edge case.
     """
     owner_role = cfg["owner_role"]
     central_conn = f"service={cfg['central_service']}"
@@ -226,22 +295,111 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
 
     validate_writers(instances, config_path)
 
-    existing = run_psql_query(
-        central_conn,
-        "SELECT instance || '|' || cluster || '|' || fdw_server "
-        "FROM stats_collect.instance_config;",
-    )
-    existing_rows = [line.split("|") for line in existing.splitlines() if line.strip()]
-    existing_names = {instance for instance, _cluster, _fdw in existing_rows}
-    existing_clusters = {cluster for _instance, cluster, _fdw in existing_rows}
-    existing_fdw_servers_by_cluster: dict[str, list[str]] = {}
-    for _instance, cluster, fdw_server in existing_rows:
-        existing_fdw_servers_by_cluster.setdefault(cluster, []).append(fdw_server)
+    live = parse_live_instance_config(central_conn)
+    config_by_name = {inst["name"]: inst for inst in instances}
 
-    new_instances = [inst for inst in instances if inst["name"] not in existing_names]
-    if not new_instances:
-        print("Nothing to do -- every instance in config.yaml is already in instance_config.")
+    new_instances = [inst for inst in instances if inst["name"] not in live]
+    removed_names = [name for name in live if name not in config_by_name]
+    changed_instances = [
+        inst for name, inst in config_by_name.items()
+        if name in live and not instance_matches_live(inst, live[name])
+    ]
+
+    if not new_instances and not removed_names and not changed_instances:
+        print("Nothing to do -- instance_config already matches config.yaml.")
         return
+
+    print(
+        f"Found {len(new_instances)} new, {len(removed_names)} removed, "
+        f"{len(changed_instances)} changed instance(s)."
+    )
+
+    # ---- Removals ---------------------------------------------------
+    removed_by_cluster: dict[str, list[str]] = {}
+    for name in removed_names:
+        removed_by_cluster.setdefault(live[name]["cluster"], []).append(name)
+
+    for name in removed_names:
+        row = live[name]
+        print(f"==> Removing instance '{name}' (cluster={row['cluster']})")
+        run_psql_command(central_conn, f"DROP SERVER IF EXISTS {row['fdw_server']} CASCADE;")
+        run_psql_command(
+            central_conn,
+            f"DELETE FROM stats_collect.instance_config WHERE instance = {sql_str(name)};",
+        )
+
+    config_clusters = {inst["cluster"] for inst in instances}
+    for cluster, names_removed in removed_by_cluster.items():
+        still_needed = cluster in config_clusters or any(
+            live_name not in removed_names and live[live_name]["cluster"] == cluster
+            for live_name in live
+        )
+        if still_needed:
+            continue
+        remote_user = live[names_removed[0]]["remote_user"]
+        print(f"==> Cluster '{cluster}' has no instances left -- dropping remote role '{remote_user}'")
+        if not run_psql_command_allow_fail(f"service={cluster}", f"DROP ROLE IF EXISTS {remote_user};"):
+            print(
+                f"    WARNING: could not drop role '{remote_user}' on cluster "
+                f"'{cluster}' (it may still own other objects there) -- left in place."
+            )
+
+    # ---- Updates to existing instances -------------------------------
+    for inst in changed_instances:
+        name = inst["name"]
+        old = live[name]
+        print(f"==> Updating instance '{name}'")
+        run_psql_command(
+            central_conn,
+            "UPDATE stats_collect.instance_config SET "
+            f"fdw_server = {sql_str(inst['fdw_server'])}, "
+            f"host = {sql_str(inst['host'])}, "
+            f"port = {int(inst['port'])}, "
+            f"database_name = {sql_str(inst['database_name'])}, "
+            f"remote_user = {sql_str(inst['remote_user'])}, "
+            f"cluster = {sql_str(inst['cluster'])}, "
+            f"instance_type = {sql_str(inst['instance_type'])}, "
+            f"sys_prefix = {sql_str(inst['sys_prefix'])}, "
+            f"pg_version = {sql_str(str(inst['pg_version']))}, "
+            f"enabled = {'true' if inst.get('enabled', True) else 'false'}, "
+            f"notes = {sql_str(inst['notes']) if inst.get('notes') else 'NULL'} "
+            f"WHERE instance = {sql_str(name)};",
+        )
+
+        if all(instance_yaml_value(inst, c) == old[c] for c in FDW_RELEVANT_COLUMNS):
+            continue  # only descriptive columns changed -- no FDW object to touch
+
+        fdw_server = old["fdw_server"]
+        if inst["fdw_server"] != old["fdw_server"]:
+            print(f"    - renaming FOREIGN SERVER {old['fdw_server']} -> {inst['fdw_server']}")
+            run_psql_command(central_conn, f"ALTER SERVER {old['fdw_server']} RENAME TO {inst['fdw_server']};")
+            fdw_server = inst["fdw_server"]
+
+        if (inst["host"] != old["host"] or str(inst["port"]) != old["port"]
+                or inst["database_name"] != old["database_name"]):
+            print(f"    - updating FOREIGN SERVER {fdw_server} connection options")
+            run_psql_command(
+                central_conn,
+                f"ALTER SERVER {fdw_server} OPTIONS "
+                f"(SET host {sql_str(inst['host'])}, SET port {sql_str(str(inst['port']))}, "
+                f"SET dbname {sql_str(inst['database_name'])});",
+            )
+
+        if inst["remote_user"] != old["remote_user"]:
+            print(f"    - updating USER MAPPING remote user for {fdw_server}")
+            run_psql_command(
+                central_conn,
+                f"ALTER USER MAPPING FOR {owner_role} SERVER {fdw_server} "
+                f"OPTIONS (SET user {sql_str(inst['remote_user'])});",
+            )
+
+    # ---- Additions ---------------------------------------------------
+    existing_clusters = {live[n]["cluster"] for n in live if n not in removed_names}
+    existing_fdw_servers_by_cluster: dict[str, list[str]] = {}
+    for n in live:
+        if n in removed_names:
+            continue
+        existing_fdw_servers_by_cluster.setdefault(live[n]["cluster"], []).append(live[n]["fdw_server"])
 
     new_by_cluster: dict[str, list[dict]] = {}
     for inst in new_instances:
@@ -279,6 +437,14 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
 
         for inst in group:
             print(f"    - adding instance {inst['name']}")
+            # instance is an instance_name ENUM with a fixed value set from
+            # 02_setup.sql -- a name added later needs a value added to
+            # the type first (separate statement: a value can't be used
+            # in the same transaction it was added in).
+            run_psql_command(
+                central_conn,
+                f"ALTER TYPE stats_collect.instance_name ADD VALUE IF NOT EXISTS {sql_str(inst['name'])};",
+            )
             run_psql_command(
                 central_conn,
                 f"INSERT INTO stats_collect.instance_config ({INSTANCE_CONFIG_COLUMNS}) "
@@ -292,7 +458,8 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
         databases = ",".join(sorted({inst["database_name"] for inst in group}))
         password_summary.append((remote_user, password, databases, [inst["name"] for inst in group]))
 
-    print_password_summary(password_summary)
+    if password_summary:
+        print_password_summary(password_summary)
 
 
 def main() -> None:

@@ -22,7 +22,7 @@ $EDITOR config.yaml
 
 It's a fresh-environment tool, not an idempotent reconciler — re-running it against an already-deployed environment fails loudly the moment it hits something that already exists (no `IF NOT EXISTS` on role/schema/table/server creation, by design). For an already-deployed environment:
 
-- **Adding instances newly listed in `config.yaml`:** `./deploy.py --update` — diffs against the live `instance_config` and runs whatever's needed for what's missing (see its docstring for the two cases it handles).
+- **Reconcile it with the current `config.yaml`:** `./deploy.py --update` — adds instances newly listed, removes ones no longer listed (dropping their FDW objects, and the remote role too if it was the last instance on that cluster), and updates the rest to match (see its docstring for the details and one known edge case).
 - **Just want the commands, not run for you:** `./deploy.py --generate-calls` — regenerates the FDW setup calls for whatever's currently in `instance_config`, printed for you to review.
 
 Either mode ends with a password summary — capture it into a password manager, it's shown once and never stored.
@@ -117,7 +117,17 @@ SELECT * FROM stats_collect.stat_collect_job ORDER BY id DESC LIMIT 1;
 SELECT * FROM stats_collect.delete_collection(9);
 ```
 
-**Add a new instance:** add it to `config.yaml`'s `instances[]`, then `./deploy.py --update`.
+**Add, remove, or update an instance:** edit `config.yaml`'s `instances[]` accordingly (add a row, delete one, or change its values), then `./deploy.py --update`.
+
+## Other existing functions
+
+Beyond `collect_stats()` and `setup_instance_fdw()` (both covered above), these also exist and are meant to be called directly when needed:
+
+| Function/command | Where | What it does |
+|---|---|---|
+| `stats_collect.delete_collection(p_job_id bigint)` | central db, SQL function | Deletes one collection's rows from all 11 `hist_*` tables plus its `stat_collect_job` row — see [Common operations](#common-operations). |
+| `./deploy.py --update [config.yaml]` | CLI | Reconciles the live `instance_config` with `config.yaml` — adds, removes, and updates instances as needed. |
+| `./deploy.py --generate-calls [config.yaml]` | CLI | Prints (doesn't run) the `01_remote_setup.sql`/`setup_instance_fdw()` commands for whatever's currently in `instance_config`. |
 
 ## License
 
