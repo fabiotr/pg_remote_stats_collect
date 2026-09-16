@@ -48,7 +48,7 @@ Either mode ends with a password summary — capture it into a password manager,
 - `instance_config` — which instances participate and how to reach each one (`instance`, `fdw_server`, `host`, `port`, `database_name`, `remote_user`, `cluster`, `instance_type`, `enabled`, `sys_prefix`, `pg_version`, `notes`) — the single source of truth `setup_instance_fdw()` reads from. `cluster` is the instance's own name if it's a writer, or its writer's name if it's a reader (no separate is-writer flag needed). `instance_type`, `sys_prefix`, `pg_version` and `notes` are descriptive only — `collect_stats()` doesn't branch on them. Populated from `config.yaml` by `deploy.py`.
 - 7 tables mirroring `pg_stat_database`, `pg_stat_database_conflicts`, `pg_statio_all_tables`, `pg_statio_all_indexes`, `pg_stat_all_tables`, `pg_stat_statements`, `pg_stat_statements_info` — same columns as the source, plus `id_stat_collect_job` + `instance`.
 - 4 tables holding "raw" (unformatted) versions of four queries from [`pg_scripts`](https://github.com/fabiotr/pg_scripts)'s `sql/` directory — same logic/filters/`LIMIT` as `schemas_94up.sql`, `object_size_90up.sql`, `tables_size_95up.sql` and `index_poor_84up.sql`, with `pg_size_pretty`/`lpad`/`round(...)::text` replaced by the underlying numeric value: `hist_schemas`, `hist_object_size`, `hist_tables_size`, `hist_index_poor`.
-- 7 reporting views (`rpt_*`), historical and synthetic — see [Reports](#reports).
+- 13 reporting views (`rpt_*`), historical and synthetic — see [Reports](#reports).
 
 ### Connecting to source instances: FDW + dblink, and why both
 
@@ -79,16 +79,22 @@ Read replicas of the same cluster share the writer's catalog and reject write st
 | View | Kind | What it shows |
 |---|---|---|
 | `rpt_job_history` | historical | every job run, with duration |
-| `rpt_db_activity_history` | historical | connections, commit/rollback, cache hit %, temp files, deadlocks per instance over time |
-| `rpt_schema_growth_history` | historical | schema size trend per instance |
+| `rpt_db_activity_history_raw` | historical | same as below, plain numeric (temp_bytes in bytes) — for further processing rather than direct reading |
+| `rpt_db_activity_history` | historical | connections, commit/rollback, cache hit %, temp files, deadlocks per instance over time, formatted for direct reading |
+| `rpt_schema_growth_history_raw` | historical | same as below, plain numeric (size in bytes) — for further processing rather than direct reading |
+| `rpt_schema_growth_history` | historical | schema size trend per instance, formatted for direct reading |
+| `rpt_tables_size_history_raw` | historical | same as below, plain numeric (sizes in bytes) — for further processing rather than direct reading |
+| `rpt_tables_size_history` | historical | size trend of the 20 largest tables per instance (replicas omitted — same size as their writer), with month-over-month growth (extrapolated to 30 days) and an estimated annual growth (extrapolated to 365 days), formatted for direct reading |
+| `rpt_stmt_totals_history_raw` | historical | same as below, plain numeric (ms, bytes) — for further processing (charts, aggregation) rather than direct reading |
+| `rpt_stmt_totals_history` | historical | `pg_stat_statements` totals for the app database, per instance, normalized to a "/day" rate since the tracked `stats_reset`, formatted for direct reading — based on [`pg_scripts`](https://github.com/fabiotr/pg_scripts)'s `statements_cluster_total_17up.sql` |
 | `rpt_latest_snapshot` | synthetic | latest-job health snapshot per instance |
 | `rpt_top_queries_latest` | synthetic | top 10 queries by total execution time, latest job per instance |
 | `rpt_index_poor_latest` | synthetic | problematic indexes, latest job per instance |
-| `rpt_never_used_everywhere` | synthetic | indexes flagged "Never Used" in **every** enabled instance at once — strong drop candidates |
+| `rpt_never_used_everywhere` | synthetic | indexes flagged "Never Used" in **every** enabled instance simultaneously, in the most recent job overall — strong drop candidates |
 
 ## Setup order (manual, if not using `deploy.py`)
 
-`01` runs on each source cluster's writer; `02`–`07` run on the central stats database.
+`01` runs on each source cluster's writer; `02`–`08` run on the central stats database.
 
 | # | File | Runs on | What it does |
 |---|---|---|---|
@@ -97,8 +103,9 @@ Read replicas of the same cluster share the writer's catalog and reject write st
 | 3 | `03_fdw_setup.sql` | central | Defines `setup_instance_fdw()` |
 | 4 | `04_collect_procedure.sql` | central | Defines `collect_stats()` |
 | 5 | `05_schedule_pg_cron.sql` | central, `postgres` db | Installs `pg_cron`, schedules the job |
-| 6 | `06_reports.sql` (`-v app_database=...`) | central | Creates the 7 `rpt_*` views |
+| 6 | `06_reports.sql` (`-v app_database=...`) | central | Creates the 13 `rpt_*` views |
 | 7 | `07_delete_collection.sql` | central | Defines `delete_collection(job_id)` |
+| 8 | `08_reports_ownership.sql` (`-v owner_role=...`) | central | Transfers ownership of every `rpt_*` view to the owner role — kept separate so the role isn't hardcoded in `06_reports.sql`; discovers the views dynamically, no list to keep in sync |
 
 ## Common operations
 

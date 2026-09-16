@@ -16,6 +16,7 @@ against a fresh (or partially fresh) environment.
      metadata lives there on RDS/Aurora -- see that file's header).
      Requires pg_cron already in shared_preload_libraries.
   8. 06_reports.sql (with -v app_database=<job.runs_in>),
+     08_reports_ownership.sql (with -v owner_role=<owner_role>),
      07_delete_collection.sql.
 
 Every password generated is printed once at the end (grouped by remote
@@ -575,6 +576,7 @@ def main() -> None:
 
     print("==> Step 8/8: reports + delete_collection utility")
     run_psql_file(central_conn, "06_reports.sql", {"app_database": cfg["job"]["runs_in"]})
+    run_psql_file(central_conn, "08_reports_ownership.sql", {"owner_role": owner_role})
     run_psql_file(central_conn, "07_delete_collection.sql")
 
     instances_for_cluster: dict[str, list[str]] = {}
