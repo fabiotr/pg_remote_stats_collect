@@ -6,7 +6,7 @@
 
 A routine that periodically collects PostgreSQL statistics from any number of instances — via Foreign Data Wrapper, no per-instance manual connection required — and stores the history in one central database, so you can track trends over time (growing tables, index bloat, query regressions) instead of only ever seeing a point-in-time snapshot.
 
-It complements the single-instance, point-in-time scripts in `sql/` and the health-check style reports in `reports/`: those tell you what an instance looks like *right now*; this stores that same kind of information *every time it runs*, across *every instance you configure*, so you can compare and trend.
+It complements the single-instance, point-in-time scripts in [`fabiotr/pg_scripts`](https://github.com/fabiotr/pg_scripts)'s `sql/` and the health-check style reports in its `reports/`: those tell you what an instance looks like *right now*; this stores that same kind of information *every time it runs*, across *every instance you configure*, so you can compare and trend.
 
 ## Requires
 
@@ -47,7 +47,7 @@ Either mode ends with a password summary — capture it into a password manager,
 - `stat_collect_job` — one row per collection run: `id`, `collect_start`, `collect_end`, `status` (`running`/`succeeded`/`failed`), `errors`.
 - `instance_config` — which instances participate and how to reach each one (`instance`, `fdw_server`, `host`, `port`, `database_name`, `remote_user`, `cluster`, `instance_type`, `enabled`, `sys_prefix`, `pg_version`, `notes`) — the single source of truth `setup_instance_fdw()` reads from. `cluster` is the instance's own name if it's a writer, or its writer's name if it's a reader (no separate is-writer flag needed). `instance_type`, `sys_prefix`, `pg_version` and `notes` are descriptive only — `collect_stats()` doesn't branch on them. Populated from `config.yaml` by `deploy.py`.
 - 7 tables mirroring `pg_stat_database`, `pg_stat_database_conflicts`, `pg_statio_all_tables`, `pg_statio_all_indexes`, `pg_stat_all_tables`, `pg_stat_statements`, `pg_stat_statements_info` — same columns as the source, plus `id_stat_collect_job` + `instance`.
-- 4 tables holding "raw" (unformatted) versions of four queries from this repo's `sql/` directory — same logic/filters/`LIMIT` as `schemas_94up.sql`, `object_size_90up.sql`, `tables_size_95up.sql` and `index_poor_84up.sql`, with `pg_size_pretty`/`lpad`/`round(...)::text` replaced by the underlying numeric value: `hist_schemas`, `hist_object_size`, `hist_tables_size`, `hist_index_poor`.
+- 4 tables holding "raw" (unformatted) versions of four queries from [`fabiotr/pg_scripts`](https://github.com/fabiotr/pg_scripts)'s `sql/` directory — same logic/filters/`LIMIT` as `schemas_94up.sql`, `object_size_90up.sql`, `tables_size_95up.sql` and `index_poor_84up.sql`, with `pg_size_pretty`/`lpad`/`round(...)::text` replaced by the underlying numeric value: `hist_schemas`, `hist_object_size`, `hist_tables_size`, `hist_index_poor`.
 - 7 reporting views (`rpt_*`), historical and synthetic — see [Reports](#reports).
 
 ### Connecting to source instances: FDW + dblink, and why both
