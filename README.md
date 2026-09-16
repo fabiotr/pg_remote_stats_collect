@@ -1,13 +1,20 @@
 # Cross-Instance Stats Collection
 
 **Category:** Assessment (cross-instance historical monitoring)
-**Requires:** `postgres_fdw`, `dblink`, `pg_stat_statements` on every monitored instance; `pg_cron` (optional, for scheduling) on the central database; `psql` and PyYAML for `deploy.py`; a `.pg_service.conf` (or `$PGSERVICEFILE`) with one entry per distinct cluster (named exactly as that cluster's value in `config.yaml`) plus one for the central database (named exactly as `central_service`) — `deploy.py` connects purely via `service=<name>`, never a host/port/password on the command line.
 
 > **Version support:** this version's schema and foreign-table column lists are hardcoded against **PostgreSQL 17**. It has not been adapted for other major versions yet — every source instance and the central database need to be on 17 (patch version, e.g. 17.4 vs 17.9, is fine). Adding multi-version support is on the roadmap; see `instance_config.pg_version` (tracked today, not yet acted on by anything) and the note in `02_setup.sql`.
 
 A routine that periodically collects PostgreSQL statistics from any number of instances — via Foreign Data Wrapper, no per-instance manual connection required — and stores the history in one central database, so you can track trends over time (growing tables, index bloat, query regressions) instead of only ever seeing a point-in-time snapshot.
 
 It complements the single-instance, point-in-time scripts in `sql/` and the health-check style reports in `reports/`: those tell you what an instance looks like *right now*; this stores that same kind of information *every time it runs*, across *every instance you configure*, so you can compare and trend.
+
+## Requires
+
+- `postgres_fdw` and `dblink` extensions on the central database (both installed by `02_setup.sql`).
+- `pg_stat_statements` already enabled on every monitored instance (this routine doesn't install it).
+- `pg_cron` on the central database — optional, only for scheduling (installed by `05_schedule_pg_cron.sql`).
+- `psql` on `PATH`, and Python 3 with PyYAML (`pip install pyyaml`) to run `deploy.py`.
+- A `.pg_service.conf` (or `$PGSERVICEFILE`) with one entry per distinct cluster — named exactly as that cluster's value in `config.yaml` — plus one entry for the central database, named exactly as `central_service`. `deploy.py` connects purely via `service=<name>`, never a host/port/password on the command line.
 
 ## Setup
 
