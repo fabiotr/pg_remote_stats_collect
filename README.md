@@ -1,7 +1,7 @@
 # Cross-Instance Stats Collection
 
 **Category:** Assessment (cross-instance historical monitoring)
-**Requires:** `postgres_fdw`, `dblink`, `pg_stat_statements` on every monitored instance; `pg_cron` (optional, for scheduling) on the central database; `psql` and PyYAML for `deploy.py`.
+**Requires:** `postgres_fdw`, `dblink`, `pg_stat_statements` on every monitored instance; `pg_cron` (optional, for scheduling) on the central database; `psql` and PyYAML for `deploy.py`; a `.pg_service.conf` (or `$PGSERVICEFILE`) with one entry per distinct cluster (named exactly as that cluster's value in `config.yaml`) plus one for the central database (named exactly as `central_service`) — `deploy.py` connects purely via `service=<name>`, never a host/port/password on the command line.
 
 > **Version support:** this version's schema and foreign-table column lists are hardcoded against **PostgreSQL 17**. It has not been adapted for other major versions yet — every source instance and the central database need to be on 17 (patch version, e.g. 17.4 vs 17.9, is fine). Adding multi-version support is on the roadmap; see `instance_config.pg_version` (tracked today, not yet acted on by anything) and the note in `02_setup.sql`.
 
