@@ -45,7 +45,10 @@ Either mode ends with a password summary — capture it into a password manager,
 
 - `instance_name` — enum of every instance you monitor, built from `config.yaml`'s `instances[]` by `deploy.py`.
 - `stat_collect_job` — one row per collection run: `id`, `collect_start`, `collect_end`, `status` (`running`/`succeeded`/`failed`), `errors`.
-- `instance_config` — which instances participate and how to reach each one (`instance`, `fdw_server`, `host`, `port`, `database_name`, `remote_user`, `cluster`, `instance_type`, `enabled`, `sys_prefix`, `pg_version`, `notes`) — the single source of truth `setup_instance_fdw()` reads from. `cluster` is the instance's own name if it's a writer, or its writer's name if it's a reader (no separate is-writer flag needed). `instance_type`, `sys_prefix`, `pg_version` and `notes` are descriptive only — `collect_stats()` doesn't branch on them. Populated from `config.yaml` by `deploy.py`.
+- `instance_config` — which instances participate and how to reach each one; the single source of truth `setup_instance_fdw()` reads from. Populated from `config.yaml` by `deploy.py`.
+  - **Columns:** `instance`, `fdw_server`, `host`, `port`, `database_name`, `remote_user`, `cluster`, `instance_type`, `enabled`, `sys_prefix`, `pg_version`, `notes`.
+  - **`cluster`** — the instance's own name if it's a writer, or its writer's name if it's a reader (no separate is-writer flag needed).
+  - **`instance_type`, `sys_prefix`, `pg_version`, `notes`** — descriptive only; `collect_stats()` doesn't branch on them.
 - 7 tables mirroring `pg_stat_database`, `pg_stat_database_conflicts`, `pg_statio_all_tables`, `pg_statio_all_indexes`, `pg_stat_all_tables`, `pg_stat_statements`, `pg_stat_statements_info` — same columns as the source, plus `id_stat_collect_job` + `instance`.
 - 4 tables holding "raw" (unformatted) versions of four queries from [`pg_scripts`](https://github.com/fabiotr/pg_scripts)'s `sql/` directory — same logic/filters/`LIMIT` as `schemas_94up.sql`, `object_size_90up.sql`, `tables_size_95up.sql` and `index_poor_84up.sql`, with `pg_size_pretty`/`lpad`/`round(...)::text` replaced by the underlying numeric value: `hist_schemas`, `hist_object_size`, `hist_tables_size`, `hist_index_poor`.
 - 13 reporting views (`rpt_*`), historical and synthetic — see [Reports](#reports).
