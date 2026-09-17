@@ -1,5 +1,5 @@
 -- Run on the central stats database as admin.
---   psql <connection target> -f 04_collect_procedure.sql
+--   psql <connection target> -v schema=stats_collect -f 04_collect_procedure.sql
 --
 -- Monthly job: picks one job id shared by every instance this run,
 -- loops over enabled instances opening each its own stat_collect_job
@@ -10,23 +10,29 @@
 -- visible and durable if the job is interrupted partway.
 --
 -- No SET clause (e.g. "SET search_path") on this procedure: Postgres
--- forbids COMMIT/ROLLBACK inside a procedure that has one. That's why
--- every reference below is schema-qualified.
+-- forbids COMMIT/ROLLBACK inside a procedure that has one. Instead it
+-- self-detects the schema it was deployed into (via GET
+-- DIAGNOSTICS/PG_CONTEXT -- see 03_fdw_setup.sql's header) and issues a
+-- plain runtime SET search_path as its first statement, which is not
+-- subject to that restriction; everything below then stays unqualified.
 
 -- Copies columns p_source_table and p_target_table have in common, by
 -- name; a target column the source doesn't have is inserted as NULL.
 -- Keeps this procedure version-agnostic -- setup_instance_fdw() is the
 -- only place that decides what an instance's foreign tables contain.
-CREATE OR REPLACE FUNCTION stats_collect.copy_matching_columns(
+-- Relies on search_path already being set by collect_stats() (its only
+-- caller) rather than self-detecting again.
+CREATE OR REPLACE FUNCTION :"schema".copy_matching_columns(
     p_source_table text,
     p_target_table text,
     p_job_id bigint,
-    p_instance stats_collect.instance_name
+    p_instance :"schema".instance_name
 ) RETURNS void
 LANGUAGE plpgsql
 AS $func$
 DECLARE
-    v_cols text;
+    v_schema name := current_schema();
+    v_cols   text;
 BEGIN
     SELECT string_agg(
         CASE WHEN fc.column_name IS NOT NULL THEN quote_ident(tc.column_name)
@@ -35,65 +41,71 @@ BEGIN
     INTO v_cols
     FROM information_schema.columns tc
     LEFT JOIN information_schema.columns fc
-        ON fc.table_schema = 'stats_collect' AND fc.table_name = p_source_table
+        ON fc.table_schema = v_schema AND fc.table_name = p_source_table
             AND fc.column_name = tc.column_name
-    WHERE tc.table_schema = 'stats_collect' AND tc.table_name = p_target_table
+    WHERE tc.table_schema = v_schema AND tc.table_name = p_target_table
         AND tc.column_name NOT IN ('id_stat_collect_job', 'instance');
 
     EXECUTE format(
-        'INSERT INTO stats_collect.%I SELECT %L::bigint, %L::stats_collect.instance_name, %s FROM stats_collect.%I',
-        p_target_table, p_job_id, p_instance::text, v_cols, p_source_table);
+        'INSERT INTO %I SELECT %L::bigint, %L::%I.instance_name, %s FROM %I',
+        p_target_table, p_job_id, p_instance::text, v_schema, v_cols, p_source_table);
 END;
 $func$;
 
-ALTER FUNCTION stats_collect.copy_matching_columns(text, text, bigint, stats_collect.instance_name) OWNER TO stats_collect_owner;
+ALTER FUNCTION :"schema".copy_matching_columns(text, text, bigint, :"schema".instance_name) OWNER TO stats_collect_owner;
 
-CREATE OR REPLACE PROCEDURE stats_collect.collect_stats()
+CREATE OR REPLACE PROCEDURE :"schema".collect_stats()
 LANGUAGE plpgsql
 AS $proc$
 DECLARE
+    v_context   text;
+    v_schema    name;
     v_job_id    bigint;
     v_inst      record;
     v_inst_err  text;
     v_version   numeric;
 BEGIN
-    v_job_id := nextval(pg_get_serial_sequence('stats_collect.stat_collect_job', 'id'));
+    GET DIAGNOSTICS v_context = PG_CONTEXT;
+    v_schema := (regexp_match(v_context, 'function ([^.]+)\.'))[1];
+    EXECUTE format('SET search_path = %I', v_schema);
+
+    v_job_id := nextval(pg_get_serial_sequence('stat_collect_job', 'id'));
 
     RAISE NOTICE '[collect_stats] job % started', v_job_id;
 
-    FOR v_inst IN SELECT * FROM stats_collect.instance_config WHERE enabled ORDER BY instance LOOP
+    FOR v_inst IN SELECT * FROM instance_config WHERE enabled ORDER BY instance LOOP
         v_inst_err := NULL;
         v_version := NULL;
         RAISE NOTICE '[collect_stats] % - starting', v_inst.instance;
 
-        INSERT INTO stats_collect.stat_collect_job (id, instance, collect_start, status)
+        INSERT INTO stat_collect_job (id, instance, collect_start, status)
         VALUES (v_job_id, v_inst.instance, clock_timestamp(), 'running');
         COMMIT;
 
         BEGIN
 
         SELECT t.version INTO v_version
-        FROM stats_collect.dblink(v_inst.fdw_server, $sql_version$
+        FROM dblink(v_inst.fdw_server, $sql_version$
             SELECT current_setting('server_version_num')::numeric
         $sql_version$) AS t(version numeric);
 
-        PERFORM stats_collect.copy_matching_columns('pg_stat_database_' || v_inst.instance, 'hist_pg_stat_database', v_job_id, v_inst.instance);
-        PERFORM stats_collect.copy_matching_columns('pg_stat_database_conflicts_' || v_inst.instance, 'hist_pg_stat_database_conflicts', v_job_id, v_inst.instance);
-        PERFORM stats_collect.copy_matching_columns('pg_statio_all_tables_' || v_inst.instance, 'hist_pg_statio_all_tables', v_job_id, v_inst.instance);
-        PERFORM stats_collect.copy_matching_columns('pg_statio_all_indexes_' || v_inst.instance, 'hist_pg_statio_all_indexes', v_job_id, v_inst.instance);
-        PERFORM stats_collect.copy_matching_columns('pg_stat_all_tables_' || v_inst.instance, 'hist_pg_stat_all_tables', v_job_id, v_inst.instance);
-        PERFORM stats_collect.copy_matching_columns('pg_stat_statements_' || v_inst.instance, 'hist_pg_stat_statements', v_job_id, v_inst.instance);
+        PERFORM copy_matching_columns('pg_stat_database_' || v_inst.instance, 'hist_pg_stat_database', v_job_id, v_inst.instance);
+        PERFORM copy_matching_columns('pg_stat_database_conflicts_' || v_inst.instance, 'hist_pg_stat_database_conflicts', v_job_id, v_inst.instance);
+        PERFORM copy_matching_columns('pg_statio_all_tables_' || v_inst.instance, 'hist_pg_statio_all_tables', v_job_id, v_inst.instance);
+        PERFORM copy_matching_columns('pg_statio_all_indexes_' || v_inst.instance, 'hist_pg_statio_all_indexes', v_job_id, v_inst.instance);
+        PERFORM copy_matching_columns('pg_stat_all_tables_' || v_inst.instance, 'hist_pg_stat_all_tables', v_job_id, v_inst.instance);
+        PERFORM copy_matching_columns('pg_stat_statements_' || v_inst.instance, 'hist_pg_stat_statements', v_job_id, v_inst.instance);
 
         -- skipped for a pre-1.9 instance -- setup_instance_fdw() never created it
-        IF to_regclass('stats_collect.' || quote_ident('pg_stat_statements_info_' || v_inst.instance)) IS NOT NULL THEN
-            PERFORM stats_collect.copy_matching_columns('pg_stat_statements_info_' || v_inst.instance, 'hist_pg_stat_statements_info', v_job_id, v_inst.instance);
+        IF to_regclass(quote_ident('pg_stat_statements_info_' || v_inst.instance)) IS NOT NULL THEN
+            PERFORM copy_matching_columns('pg_stat_statements_info_' || v_inst.instance, 'hist_pg_stat_statements_info', v_job_id, v_inst.instance);
         END IF;
 
         -- ---- raw queries via dblink ----
 
-        INSERT INTO stats_collect.hist_schemas
+        INSERT INTO hist_schemas
         SELECT v_job_id, v_inst.instance, s.*
-        FROM stats_collect.dblink(v_inst.fdw_server, $sql_schemas$
+        FROM dblink(v_inst.fdw_server, $sql_schemas$
             SELECT
                 nspname,
                 size,
@@ -126,9 +138,9 @@ BEGIN
             sequences bigint, views bigint, types bigint, foreign_tables bigint
         );
 
-        INSERT INTO stats_collect.hist_object_size
+        INSERT INTO hist_object_size
         SELECT v_job_id, v_inst.instance, s.*
-        FROM stats_collect.dblink(v_inst.fdw_server, $sql_objsize$
+        FROM dblink(v_inst.fdw_server, $sql_objsize$
             SELECT
                 coalesce(t.spcname, nullif(current_setting('default_tablespace'),''), 'pg_default') AS tablespace,
                 n.nspname AS schema,
@@ -156,9 +168,9 @@ BEGIN
             size bigint, rows real
         );
 
-        INSERT INTO stats_collect.hist_tables_size
+        INSERT INTO hist_tables_size
         SELECT v_job_id, v_inst.instance, s.*
-        FROM stats_collect.dblink(v_inst.fdw_server, $sql_tblsize$
+        FROM dblink(v_inst.fdw_server, $sql_tblsize$
             SELECT
                 coalesce(t.spcname, nullif(current_setting('default_tablespace'),''), 'pg_default') AS tablespace,
                 n.nspname AS schema,
@@ -192,9 +204,9 @@ BEGIN
             toast_size_pct numeric, rows real, avg_row_size numeric
         );
 
-        INSERT INTO stats_collect.hist_index_poor
+        INSERT INTO hist_index_poor
         SELECT v_job_id, v_inst.instance, s.*
-        FROM stats_collect.dblink(v_inst.fdw_server, $sql_idxpoor$
+        FROM dblink(v_inst.fdw_server, $sql_idxpoor$
             WITH table_scans AS (
                 SELECT relid,
                     tables.idx_scan + tables.seq_scan AS all_scans,
@@ -265,12 +277,12 @@ BEGIN
 
         IF v_inst_err IS NOT NULL THEN
             RAISE NOTICE '[collect_stats] % - FAILED: %', v_inst.instance, v_inst_err;
-            UPDATE stats_collect.stat_collect_job
+            UPDATE stat_collect_job
             SET collect_end = clock_timestamp(), status = 'failed', version = v_version, errors = ARRAY[v_inst_err]
             WHERE id = v_job_id AND instance = v_inst.instance;
         ELSE
             RAISE NOTICE '[collect_stats] % - done', v_inst.instance;
-            UPDATE stats_collect.stat_collect_job
+            UPDATE stat_collect_job
             SET collect_end = clock_timestamp(), status = 'succeeded', version = v_version
             WHERE id = v_job_id AND instance = v_inst.instance;
         END IF;
@@ -280,10 +292,10 @@ BEGIN
 
     RAISE NOTICE '[collect_stats] job % finished - % instance(s) with errors',
         v_job_id,
-        (SELECT count(*) FROM stats_collect.stat_collect_job WHERE id = v_job_id AND status = 'failed');
+        (SELECT count(*) FROM stat_collect_job WHERE id = v_job_id AND status = 'failed');
 END;
 $proc$;
 
-ALTER PROCEDURE stats_collect.collect_stats() OWNER TO stats_collect_owner;
+ALTER PROCEDURE :"schema".collect_stats() OWNER TO stats_collect_owner;
 
--- Manual test: CALL stats_collect.collect_stats();
+-- Manual test: CALL <schema>.collect_stats();

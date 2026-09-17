@@ -1,10 +1,10 @@
 -- Run on the central stats database as admin.
--- Requires -v instance_name_values="'<a>','<b>',..." (deploy.py computes
--- this from config.yaml automatically):
---   psql <connection target> -f 02_setup.sql -v instance_name_values="'main','main_replica1'"
+-- Requires -v schema=<name> -v instance_name_values="'<a>','<b>',..."
+-- (deploy.py computes/passes both from config.yaml automatically):
+--   psql <connection target> -f 02_setup.sql -v schema=stats_collect -v instance_name_values="'main','main_replica1'"
 
 CREATE ROLE stats_collect_owner NOLOGIN;
-CREATE SCHEMA stats_collect AUTHORIZATION stats_collect_owner;
+CREATE SCHEMA :"schema" AUTHORIZATION stats_collect_owner;
 
 -- Backs the foreign servers/tables 03_fdw_setup.sql creates.
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
@@ -13,10 +13,13 @@ CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 -- call VOLATILE size functions that postgres_fdw can't push down to the
 -- remote side, so those run through dblink instead, which sends the
 -- whole query text over to execute remotely.
-CREATE EXTENSION IF NOT EXISTS dblink SCHEMA stats_collect;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA stats_collect TO stats_collect_owner;
+CREATE EXTENSION IF NOT EXISTS dblink SCHEMA :"schema";
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA :"schema" TO stats_collect_owner;
 
-SET search_path = stats_collect;
+-- Everything below is unqualified, relying on this -- so it lands in
+-- whichever schema -v schema= names, with no other hardcoded reference
+-- to the schema name anywhere in this file.
+SET search_path = :"schema";
 
 -- instance_name_values is psql-substituted above the DO block (not
 -- inside it -- psql doesn't substitute inside dollar-quoted text) via a
@@ -399,7 +402,7 @@ BEGIN
         'hist_pg_stat_all_tables', 'hist_pg_stat_statements', 'hist_pg_stat_statements_info',
         'hist_schemas', 'hist_object_size', 'hist_tables_size', 'hist_index_poor'
     ] LOOP
-        EXECUTE format('ALTER TABLE stats_collect.%I OWNER TO stats_collect_owner', v_tbl);
+        EXECUTE format('ALTER TABLE %I OWNER TO stats_collect_owner', v_tbl);
     END LOOP;
 END $$;
 

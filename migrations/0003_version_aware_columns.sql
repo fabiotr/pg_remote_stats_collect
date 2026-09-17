@@ -15,27 +15,27 @@
 
 BEGIN;
 
-ALTER TABLE stats_collect.hist_pg_stat_database
+ALTER TABLE :"schema".hist_pg_stat_database
     ADD COLUMN parallel_workers_to_launch bigint,
     ADD COLUMN parallel_workers_launched  bigint;
 
-ALTER TABLE stats_collect.hist_pg_stat_database_conflicts
+ALTER TABLE :"schema".hist_pg_stat_database_conflicts
     ADD COLUMN stats_reset timestamptz;
 
-ALTER TABLE stats_collect.hist_pg_statio_all_tables
+ALTER TABLE :"schema".hist_pg_statio_all_tables
     ADD COLUMN stats_reset timestamptz;
 
-ALTER TABLE stats_collect.hist_pg_statio_all_indexes
+ALTER TABLE :"schema".hist_pg_statio_all_indexes
     ADD COLUMN stats_reset timestamptz;
 
-ALTER TABLE stats_collect.hist_pg_stat_all_tables
+ALTER TABLE :"schema".hist_pg_stat_all_tables
     ADD COLUMN total_vacuum_time      double precision,
     ADD COLUMN total_autovacuum_time  double precision,
     ADD COLUMN total_analyze_time     double precision,
     ADD COLUMN total_autoanalyze_time double precision,
     ADD COLUMN stats_reset            timestamptz;
 
-ALTER TABLE stats_collect.hist_pg_stat_statements
+ALTER TABLE :"schema".hist_pg_stat_statements
     ADD COLUMN total_time    double precision,
     ADD COLUMN min_time      double precision,
     ADD COLUMN max_time      double precision,

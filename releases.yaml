@@ -65,3 +65,22 @@ releases:
       covering PostgreSQL 8.4-19 and pg_stat_statements 1.0-1.13,
       floored at 10/1.6 for the actually-supported range.
     migration: migrations/0003_version_aware_columns.sql
+
+  - version: "0.4.0"
+    description: >-
+      Schema name is now genuinely configurable via config.yaml's
+      schema key, instead of only asserted against a hardcoded
+      "stats_collect" in 02_setup.sql. Every procedure/function
+      self-detects the schema it was deployed into at runtime (via
+      GET DIAGNOSTICS/PG_CONTEXT) and issues a plain SET search_path
+      as its first statement, so the rest of its body stays
+      unqualified; static DDL (02/06/07/08, migrations) uses plain
+      -v schema= psql substitution. Also adds
+      setup_instance_fdw()'s companion refresh_instance_fdw(instance):
+      drops and rebuilds one already-deployed instance's 7 foreign
+      tables against its current version/extversion, reusing the
+      existing FOREIGN SERVER/USER MAPPING -- no password needed --
+      so an instance can pick up new version tiers (like 0.3.0's)
+      without a full re-deploy. Nothing to migrate: existing objects
+      already live in whichever schema they were created in.
+    migration: null

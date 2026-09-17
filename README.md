@@ -39,10 +39,12 @@ Either mode ends with a password summary — capture it into a password manager,
 
 ### Roles
 
-- **`stats_collect_owner`** (central database, `NOLOGIN`) — owns the `stats_collect` schema and everything in it. Never connects directly; `pg_cron` runs the job as this role through its internal worker, which doesn't need `LOGIN`. For manual testing, `SET ROLE stats_collect_owner` first.
+- **`stats_collect_owner`** (central database, `NOLOGIN`) — owns the schema (`stats_collect` by default — see below) and everything in it. Never connects directly; `pg_cron` runs the job as this role through its internal worker, which doesn't need `LOGIN`. For manual testing, `SET ROLE stats_collect_owner` first.
 - **`stats_collect_<cluster>`** — one per source **cluster**, not per instance (see below) — created via `01_remote_setup.sql`. Used only as the remote login for FDW connections; member of `pg_monitor` so it can read `pg_stat_statements` for every user, not just its own queries.
 
-### Schema layout (`stats_collect`)
+### Schema layout (`stats_collect`, configurable via `config.yaml`'s `schema` key)
+
+Every procedure/function below self-detects the schema it was deployed into at runtime (`GET DIAGNOSTICS`/`PG_CONTEXT`) instead of hardcoding it, so a `schema:` value other than the default works with no further changes — see [Versioning](#versioning-releasesyaml)'s 0.4.0 entry.
 
 - `instance_name` — enum of every instance you monitor, built from `config.yaml`'s `instances[]` by `deploy.py`.
 - `schema_releases` — one row per project release: `version` (primary key, semver, matches [`releases.yaml`](releases.yaml)), `deployed_at`, `description`. See [Versioning](#versioning-releasesyaml).
@@ -73,7 +75,7 @@ Read replicas of the same cluster share the writer's catalog and reject write st
 - `RAISE NOTICE` at every step, visible in an interactive `psql` session.
 - Closes each instance's own row `'succeeded'` or `'failed'`, independently — one instance failing doesn't affect another's status.
 
-**Design constraint:** this procedure can't have a `SET` clause or be `SECURITY DEFINER` — PostgreSQL rejects internal `COMMIT`/`ROLLBACK` in both cases. That's why every reference inside it is schema-qualified instead of relying on `search_path`, and why it stays `SECURITY INVOKER` — `pg_cron` already runs it as `stats_collect_owner`.
+**Design constraint:** this procedure can't have a `SET` clause or be `SECURITY DEFINER` — PostgreSQL rejects internal `COMMIT`/`ROLLBACK` in both cases. Instead it self-detects the schema it was deployed into (`GET DIAGNOSTICS`/`PG_CONTEXT`) and issues a plain runtime `SET search_path` as its first statement, which isn't subject to that restriction — every reference after that stays unqualified. It also stays `SECURITY INVOKER` — `pg_cron` already runs it as `stats_collect_owner`.
 
 ### Scheduling
 
@@ -113,13 +115,13 @@ Adding a new release: bump `releases.yaml` (new entry, `migration:` pointing at 
 | # | File | Runs on | What it does |
 |---|---|---|---|
 | 1 | `01_remote_setup.sql` | each cluster's writer (`-v role_name=... -v role_password=...`) | Creates the remote login role, grants `pg_monitor` |
-| 2 | `02_setup.sql` (`-v instance_name_values=...`) | central | Owner role, schema, types, tables |
-| 3 | `03_fdw_setup.sql` | central | Defines `setup_instance_fdw()` |
-| 4 | `04_collect_procedure.sql` | central | Defines `collect_stats()` |
+| 2 | `02_setup.sql` (`-v schema=... -v instance_name_values=...`) | central | Owner role, schema, types, tables |
+| 3 | `03_fdw_setup.sql` (`-v schema=...`) | central | Defines `setup_instance_fdw()`/`refresh_instance_fdw()` |
+| 4 | `04_collect_procedure.sql` (`-v schema=...`) | central | Defines `collect_stats()` |
 | 5 | `05_schedule_pg_cron.sql` | central, `postgres` db | Installs `pg_cron`, schedules the job |
-| 6 | `06_reports.sql` (`-v app_database=...`) | central | Creates the 13 `rpt_*` views |
-| 7 | `07_delete_collection.sql` | central | Defines `delete_collection(job_id)` |
-| 8 | `08_reports_ownership.sql` (`-v owner_role=...`) | central | Transfers ownership of every `rpt_*` view to the owner role — kept separate so the role isn't hardcoded in `06_reports.sql`; discovers the views dynamically, no list to keep in sync |
+| 6 | `06_reports.sql` (`-v schema=... -v app_database=...`) | central | Creates the 13 `rpt_*` views |
+| 7 | `07_delete_collection.sql` (`-v schema=...`) | central | Defines `delete_collection(job_id)` |
+| 8 | `08_reports_ownership.sql` (`-v schema=... -v owner_role=...`) | central | Transfers ownership of every `rpt_*` view to the owner role — kept separate so the role isn't hardcoded in `06_reports.sql`; discovers the views dynamically, no list to keep in sync |
 
 ## Common operations
 
@@ -154,6 +156,7 @@ Beyond `collect_stats()` and `setup_instance_fdw()` (both covered above), these 
 | Function/command | Where | What it does |
 |---|---|---|
 | `stats_collect.delete_collection(p_job_id bigint)` | central db, SQL function | Deletes one collection's rows from all 11 `hist_*` tables plus its `stat_collect_job` row — see [Common operations](#common-operations). |
+| `stats_collect.refresh_instance_fdw(p_instance instance_name)` | central db, procedure (`SET ROLE stats_collect_owner` first) | For an already-deployed instance: drops and rebuilds its 7 foreign tables against its *current* version/extversion — e.g. after a real PostgreSQL upgrade, or to pick up new version tiers added by a later release. Reuses the existing `FOREIGN SERVER`/`USER MAPPING`, no password needed. |
 | `./deploy.py --update [config.yaml]` | CLI | Reconciles the live `instance_config` with `config.yaml` — adds, removes, and updates instances as needed. |
 | `./deploy.py --generate-calls [config.yaml]` | CLI | Prints (doesn't run) the `01_remote_setup.sql`/`setup_instance_fdw()` commands for whatever's currently in `instance_config`. |
 | `./deploy.py --migrate [config.yaml]` | CLI | Brings an already-deployed environment's `schema_releases` up to date with `releases.yaml`. |

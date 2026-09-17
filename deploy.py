@@ -20,7 +20,7 @@ against a fresh (or partially fresh) environment.
      07_delete_collection.sql.
 
 Right after step 2, every release in releases.yaml (this project's
-version) is stamped into stats_collect.schema_releases at once,
+version) is stamped into <schema>.schema_releases at once,
 deployed_at = now(): 01..08 already build the schema at the latest
 release directly, so a fresh deploy has nothing to migrate, only to
 record.
@@ -188,7 +188,7 @@ LIVE_INSTANCE_COLUMNS = (
 FDW_RELEVANT_COLUMNS = ("fdw_server", "host", "port", "database_name", "remote_user")
 
 
-def parse_live_instance_config(central_conn: str) -> dict[str, dict[str, str]]:
+def parse_live_instance_config(central_conn: str, schema: str) -> dict[str, dict[str, str]]:
     """{instance: {column: value}} for every row in instance_config,
     values as plain strings exactly as psql prints them -- compare
     with instance_yaml_value() rather than assuming a type."""
@@ -196,7 +196,7 @@ def parse_live_instance_config(central_conn: str) -> dict[str, dict[str, str]]:
         central_conn,
         "SELECT instance || '|' || " + " || '|' || ".join(LIVE_INSTANCE_COLUMNS).replace(
             "notes", "coalesce(notes, '')"
-        ) + " FROM stats_collect.instance_config ORDER BY instance;",
+        ) + f" FROM {schema}.instance_config ORDER BY instance;",
     )
     live: dict[str, dict[str, str]] = {}
     for line in raw.splitlines():
@@ -229,7 +229,7 @@ def instance_matches_live(inst: dict, live_row: dict[str, str]) -> bool:
     )
 
 
-def generate_setup_calls(central_conn: str) -> None:
+def generate_setup_calls(central_conn: str, schema: str) -> None:
     """For an already-deployed environment: (re)generates the
     01_remote_setup.sql and setup_instance_fdw() calls for whatever is
     currently in instance_config -- typically after adding one new
@@ -243,11 +243,11 @@ def generate_setup_calls(central_conn: str) -> None:
     raw = run_psql_query(
         central_conn,
         "SELECT instance || '|' || cluster || '|' || remote_user || '|' || host || '|' || database_name "
-        "FROM stats_collect.instance_config ORDER BY cluster, instance;",
+        f"FROM {schema}.instance_config ORDER BY cluster, instance;",
     )
     rows = [line.split("|") for line in raw.splitlines() if line.strip()]
     if not rows:
-        sys.exit("No rows in stats_collect.instance_config -- nothing to generate.")
+        sys.exit(f"No rows in {schema}.instance_config -- nothing to generate.")
 
     password_for_cluster: dict[str, str] = {}
     remote_user_for_cluster: dict[str, str] = {}
@@ -285,7 +285,7 @@ def generate_setup_calls(central_conn: str) -> None:
     print("# =============================================================")
     for instance, cluster, _remote_user, _host, _database_name in rows:
         password = password_for_cluster[cluster]
-        print(f"CALL stats_collect.setup_instance_fdw('{instance}', '{password}');")
+        print(f"CALL {schema}.setup_instance_fdw('{instance}', '{password}');")
 
     print_password_summary([
         (
@@ -303,13 +303,14 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
     config.yaml -- see the module docstring for the three passes
     (remove/update/add) and the one known edge case.
     """
+    schema = cfg["schema"]
     owner_role = cfg["owner_role"]
     central_conn = f"service={cfg['central_service']}"
     instances = cfg["instances"]
 
     validate_writers(instances, config_path)
 
-    live = parse_live_instance_config(central_conn)
+    live = parse_live_instance_config(central_conn, schema)
     config_by_name = {inst["name"]: inst for inst in instances}
 
     new_instances = [inst for inst in instances if inst["name"] not in live]
@@ -339,7 +340,7 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
         run_psql_command(central_conn, f"DROP SERVER IF EXISTS {row['fdw_server']} CASCADE;")
         run_psql_command(
             central_conn,
-            f"DELETE FROM stats_collect.instance_config WHERE instance = {sql_str(name)};",
+            f"DELETE FROM {schema}.instance_config WHERE instance = {sql_str(name)};",
         )
 
     config_clusters = {inst["cluster"] for inst in instances}
@@ -365,7 +366,7 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
         print(f"==> Updating instance '{name}'")
         run_psql_command(
             central_conn,
-            "UPDATE stats_collect.instance_config SET "
+            f"UPDATE {schema}.instance_config SET "
             f"fdw_server = {sql_str(inst['fdw_server'])}, "
             f"host = {sql_str(inst['host'])}, "
             f"port = {int(inst['port'])}, "
@@ -456,16 +457,16 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
             # in the same transaction it was added in).
             run_psql_command(
                 central_conn,
-                f"ALTER TYPE stats_collect.instance_name ADD VALUE IF NOT EXISTS {sql_str(inst['name'])};",
+                f"ALTER TYPE {schema}.instance_name ADD VALUE IF NOT EXISTS {sql_str(inst['name'])};",
             )
             run_psql_command(
                 central_conn,
-                f"INSERT INTO stats_collect.instance_config ({INSTANCE_CONFIG_COLUMNS}) "
+                f"INSERT INTO {schema}.instance_config ({INSTANCE_CONFIG_COLUMNS}) "
                 f"VALUES {instance_config_values(inst)};",
             )
             run_psql_command(
                 central_conn,
-                f"CALL stats_collect.setup_instance_fdw('{inst['name']}', '{password}');",
+                f"CALL {schema}.setup_instance_fdw('{inst['name']}', '{password}');",
             )
 
         databases = ",".join(sorted({inst["database_name"] for inst in group}))
@@ -481,23 +482,23 @@ def load_releases() -> list[dict]:
     return yaml.safe_load(Path("releases.yaml").read_text())["releases"]
 
 
-def record_release(central_conn: str, version: str, description: str) -> None:
+def record_release(central_conn: str, schema: str, version: str, description: str) -> None:
     run_psql_command(
         central_conn,
-        "INSERT INTO stats_collect.schema_releases (version, description) VALUES "
+        f"INSERT INTO {schema}.schema_releases (version, description) VALUES "
         f"({sql_str(version)}, {sql_str(description.strip())});",
     )
 
 
-def stamp_all_releases(central_conn: str) -> None:
+def stamp_all_releases(central_conn: str, schema: str) -> None:
     """Fresh deploy only: 01_remote_setup.sql..08_reports_ownership.sql
     already build the schema at releases.yaml's latest release directly,
     so every release is simply recorded, deployed_at = now() for all."""
     for release in load_releases():
-        record_release(central_conn, release["version"], release["description"])
+        record_release(central_conn, schema, release["version"], release["description"])
 
 
-def migrate_deploy(central_conn: str, owner_role: str) -> None:
+def migrate_deploy(central_conn: str, schema: str, owner_role: str) -> None:
     """--migrate: brings an already-deployed environment's
     schema_releases up to date with releases.yaml, running every
     release's migration (migrations/NNNN_*.sql) newer than what's
@@ -507,19 +508,19 @@ def migrate_deploy(central_conn: str, owner_role: str) -> None:
     deployed before this versioning system existed."""
     run_psql_command(
         central_conn,
-        "CREATE TABLE IF NOT EXISTS stats_collect.schema_releases ("
+        f"CREATE TABLE IF NOT EXISTS {schema}.schema_releases ("
         "version text primary key, "
         "deployed_at timestamptz not null default clock_timestamp(), "
         "description text not null);",
     )
     run_psql_command(
         central_conn,
-        f"ALTER TABLE stats_collect.schema_releases OWNER TO {owner_role};",
+        f"ALTER TABLE {schema}.schema_releases OWNER TO {owner_role};",
     )
 
     live_versions = {
         line.strip()
-        for line in run_psql_query(central_conn, "SELECT version FROM stats_collect.schema_releases;").splitlines()
+        for line in run_psql_query(central_conn, f"SELECT version FROM {schema}.schema_releases;").splitlines()
         if line.strip()
     }
 
@@ -533,8 +534,8 @@ def migrate_deploy(central_conn: str, owner_role: str) -> None:
         migration = release.get("migration")
         print(f"==> Applying release {version}: {release['description'].strip()}")
         if migration:
-            run_psql_file(central_conn, migration)
-        record_release(central_conn, version, release["description"])
+            run_psql_file(central_conn, migration, {"schema": schema})
+        record_release(central_conn, schema, version, release["description"])
         print(f"    - recorded in schema_releases")
 
     print(f"==> Now at release {pending[-1]['version']}.")
@@ -557,9 +558,10 @@ def main() -> None:
 
     cfg = yaml.safe_load(config_path.read_text())
     central_conn = f"service={cfg['central_service']}"
+    schema = cfg["schema"]
 
     if generate_calls_only:
-        generate_setup_calls(central_conn)
+        generate_setup_calls(central_conn, schema)
         return
 
     if update_only:
@@ -567,24 +569,12 @@ def main() -> None:
         return
 
     if migrate_only:
-        migrate_deploy(central_conn, cfg["owner_role"])
+        migrate_deploy(central_conn, schema, cfg["owner_role"])
         return
 
-    schema = cfg["schema"]
     owner_role = cfg["owner_role"]
     job_name = cfg["job"]["name"]
     instances = cfg["instances"]
-
-    # config.yaml claiming a different schema/owner than what
-    # 02_setup.sql actually creates would silently deploy the wrong
-    # thing -- 03/04/etc. all assume stats_collect/stats_collect_owner.
-    expected_line = f"CREATE SCHEMA {schema} AUTHORIZATION {owner_role};"
-    if expected_line not in Path("02_setup.sql").read_text():
-        sys.exit(
-            f"ERROR: config.yaml's schema ({schema}) / owner_role ({owner_role}) "
-            "don't match the CREATE SCHEMA line in 02_setup.sql. "
-            "Update one or the other before deploying."
-        )
 
     instance_name_values = ",".join(f"'{inst['name']}'" for inst in instances)
 
@@ -614,19 +604,20 @@ def main() -> None:
     print("==> Step 2/8: schema, role, types, tables (02_setup.sql)")
     run([
         "psql", central_conn, "-X", "-v", "ON_ERROR_STOP=1",
+        "-v", f"schema={schema}",
         "-v", f"instance_name_values={instance_name_values}",
         "-f", "02_setup.sql",
     ])
-    stamp_all_releases(central_conn)
+    stamp_all_releases(central_conn, schema)
 
     print("==> Step 3/8: FDW procedure definition (03_fdw_setup.sql)")
-    run_psql_file(central_conn, "03_fdw_setup.sql")
+    run_psql_file(central_conn, "03_fdw_setup.sql", {"schema": schema})
 
     print("==> Step 4/8: populating instance_config from config.yaml")
     insert_values = ",\n    ".join(instance_config_values(inst) for inst in instances)
     run_psql_command(
         central_conn,
-        f"INSERT INTO stats_collect.instance_config ({INSTANCE_CONFIG_COLUMNS}) VALUES\n"
+        f"INSERT INTO {schema}.instance_config ({INSTANCE_CONFIG_COLUMNS}) VALUES\n"
         f"    {insert_values};",
     )
 
@@ -639,11 +630,11 @@ def main() -> None:
         print(f"    - {name} (cluster={cluster}, as {remote_user})")
         run_psql_command(
             central_conn,
-            f"CALL stats_collect.setup_instance_fdw('{name}', '{password}');",
+            f"CALL {schema}.setup_instance_fdw('{name}', '{password}');",
         )
 
     print("==> Step 6/8: collection procedure (04_collect_procedure.sql)")
-    run_psql_file(central_conn, "04_collect_procedure.sql")
+    run_psql_file(central_conn, "04_collect_procedure.sql", {"schema": schema})
 
     print("==> Step 7/8: pg_cron schedule (05_schedule_pg_cron.sql)")
     print(
@@ -658,9 +649,9 @@ def main() -> None:
     )
 
     print("==> Step 8/8: reports + delete_collection utility")
-    run_psql_file(central_conn, "06_reports.sql", {"app_database": cfg["job"]["runs_in"]})
-    run_psql_file(central_conn, "08_reports_ownership.sql", {"owner_role": owner_role})
-    run_psql_file(central_conn, "07_delete_collection.sql")
+    run_psql_file(central_conn, "06_reports.sql", {"schema": schema, "app_database": cfg["job"]["runs_in"]})
+    run_psql_file(central_conn, "08_reports_ownership.sql", {"schema": schema, "owner_role": owner_role})
+    run_psql_file(central_conn, "07_delete_collection.sql", {"schema": schema})
 
     instances_for_cluster: dict[str, list[str]] = {}
     databases_for_cluster: dict[str, set[str]] = {}

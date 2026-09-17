@@ -1,9 +1,9 @@
 -- =====================================================================
--- Release 1.1.0 migration -- see releases.yaml. Applied automatically
+-- Release 0.2.0 migration -- see releases.yaml. Applied automatically
 -- by `./deploy.py --migrate` against an already-deployed environment;
 -- run directly with psql only if you're not using deploy.py:
 --
---   psql <connection target> -f migrations/0002_stat_collect_job_per_instance.sql
+--   psql <connection target> -v schema=stats_collect -f migrations/0002_stat_collect_job_per_instance.sql
 --
 -- After this runs (by either path), also re-run 06_reports.sql and
 -- 08_reports_ownership.sql -- their view definitions changed to match.
@@ -47,34 +47,34 @@ BEGIN;
 -- Keep the pre-migration table around for reference (original 1-row-
 -- per-job data, including the old shared `errors` array) -- drop it
 -- yourself once you're confident you don't need it.
-CREATE TABLE stats_collect.stat_collect_job_pre_migration AS
-    SELECT * FROM stats_collect.stat_collect_job;
+CREATE TABLE :"schema".stat_collect_job_pre_migration AS
+    SELECT * FROM :"schema".stat_collect_job;
 
 -- ---- 1. Drop every hist_* table's existing FK (single-column, to id) ----
-ALTER TABLE stats_collect.hist_pg_stat_database           DROP CONSTRAINT hist_pg_stat_database_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_pg_stat_database_conflicts  DROP CONSTRAINT hist_pg_stat_database_conflicts_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_pg_statio_all_tables        DROP CONSTRAINT hist_pg_statio_all_tables_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_pg_statio_all_indexes       DROP CONSTRAINT hist_pg_statio_all_indexes_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_pg_stat_all_tables          DROP CONSTRAINT hist_pg_stat_all_tables_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_pg_stat_statements          DROP CONSTRAINT hist_pg_stat_statements_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_pg_stat_statements_info     DROP CONSTRAINT hist_pg_stat_statements_info_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_schemas                     DROP CONSTRAINT hist_schemas_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_object_size                 DROP CONSTRAINT hist_object_size_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_tables_size                 DROP CONSTRAINT hist_tables_size_id_stat_collect_job_fkey;
-ALTER TABLE stats_collect.hist_index_poor                  DROP CONSTRAINT hist_index_poor_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_pg_stat_database           DROP CONSTRAINT hist_pg_stat_database_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_pg_stat_database_conflicts  DROP CONSTRAINT hist_pg_stat_database_conflicts_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_pg_statio_all_tables        DROP CONSTRAINT hist_pg_statio_all_tables_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_pg_statio_all_indexes       DROP CONSTRAINT hist_pg_statio_all_indexes_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_pg_stat_all_tables          DROP CONSTRAINT hist_pg_stat_all_tables_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_pg_stat_statements          DROP CONSTRAINT hist_pg_stat_statements_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_pg_stat_statements_info     DROP CONSTRAINT hist_pg_stat_statements_info_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_schemas                     DROP CONSTRAINT hist_schemas_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_object_size                 DROP CONSTRAINT hist_object_size_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_tables_size                 DROP CONSTRAINT hist_tables_size_id_stat_collect_job_fkey;
+ALTER TABLE :"schema".hist_index_poor                  DROP CONSTRAINT hist_index_poor_id_stat_collect_job_fkey;
 
 -- ---- 2. Add the new columns (nullable for now), and drop the OLD
 -- single-column primary key -- it would otherwise reject the exploded
 -- per-instance rows in step 3 below (several rows sharing the same id).
-ALTER TABLE stats_collect.stat_collect_job ADD COLUMN instance stats_collect.instance_name;
-ALTER TABLE stats_collect.stat_collect_job ADD COLUMN version numeric;
-ALTER TABLE stats_collect.stat_collect_job DROP CONSTRAINT stat_collect_job_pkey;
+ALTER TABLE :"schema".stat_collect_job ADD COLUMN instance :"schema".instance_name;
+ALTER TABLE :"schema".stat_collect_job ADD COLUMN version numeric;
+ALTER TABLE :"schema".stat_collect_job DROP CONSTRAINT stat_collect_job_pkey;
 
 -- ---- 3. Explode each old job row into one row per instance with data ----
-INSERT INTO stats_collect.stat_collect_job (id, instance, version, collect_start, collect_end, status, errors)
+INSERT INTO :"schema".stat_collect_job (id, instance, version, collect_start, collect_end, status, errors)
 SELECT j.id, d.instance, NULL, j.collect_start, j.collect_end, j.status, '{}'::text[]
-FROM stats_collect.stat_collect_job j
-    JOIN (SELECT DISTINCT id_stat_collect_job, instance FROM stats_collect.hist_pg_stat_database) d
+FROM :"schema".stat_collect_job j
+    JOIN (SELECT DISTINCT id_stat_collect_job, instance FROM :"schema".hist_pg_stat_database) d
         ON d.id_stat_collect_job = j.id
 WHERE j.instance IS NULL;
 
@@ -82,32 +82,32 @@ WHERE j.instance IS NULL;
 -- exploded (a job with zero successful instances leaves no exploded
 -- row and is simply dropped here -- it has nothing for any FK to
 -- reference anyway).
-DELETE FROM stats_collect.stat_collect_job WHERE instance IS NULL;
+DELETE FROM :"schema".stat_collect_job WHERE instance IS NULL;
 
 -- ---- 4. Enforce instance NOT NULL and add the new composite primary key ----
-ALTER TABLE stats_collect.stat_collect_job ALTER COLUMN instance SET NOT NULL;
-ALTER TABLE stats_collect.stat_collect_job ADD PRIMARY KEY (id, instance);
+ALTER TABLE :"schema".stat_collect_job ALTER COLUMN instance SET NOT NULL;
+ALTER TABLE :"schema".stat_collect_job ADD PRIMARY KEY (id, instance);
 
 -- ---- 5. Recreate every hist_* table's FK as composite ----
-ALTER TABLE stats_collect.hist_pg_stat_database           ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_pg_stat_database_conflicts  ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_pg_statio_all_tables        ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_pg_statio_all_indexes       ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_pg_stat_all_tables          ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_pg_stat_statements          ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_pg_stat_statements_info     ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_schemas                     ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_object_size                 ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_tables_size                 ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
-ALTER TABLE stats_collect.hist_index_poor                  ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_pg_stat_database           ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_pg_stat_database_conflicts  ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_pg_statio_all_tables        ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_pg_statio_all_indexes       ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_pg_stat_all_tables          ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_pg_stat_statements          ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_pg_stat_statements_info     ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_schemas                     ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_object_size                 ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_tables_size                 ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
+ALTER TABLE :"schema".hist_index_poor                  ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES :"schema".stat_collect_job (id, instance);
 
 -- ---- 6. Backfill version from instance_config.pg_version before it's dropped ----
-UPDATE stats_collect.stat_collect_job job
+UPDATE :"schema".stat_collect_job job
 SET version = split_part(ic.pg_version, '.', 1)::int * 10000 + split_part(ic.pg_version, '.', 2)::int
-FROM stats_collect.instance_config ic
+FROM :"schema".instance_config ic
 WHERE ic.instance = job.instance AND job.version IS NULL;
 
 -- ---- 7. instance_config.pg_version is superseded by stat_collect_job.version ----
-ALTER TABLE stats_collect.instance_config DROP COLUMN pg_version;
+ALTER TABLE :"schema".instance_config DROP COLUMN pg_version;
 
 COMMIT;

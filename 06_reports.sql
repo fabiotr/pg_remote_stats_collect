@@ -1,13 +1,13 @@
 -- =====================================================================
 -- Run on the central stats database as admin (no SET ROLE).
 --
--- Requires -v app_database=<name> — the application database name on
--- the source instances (config.yaml's job.runs_in), used to filter
--- pg_stat_database rows down to that one database instead of every
--- database on the instance. deploy.py passes this automatically; for a
--- manual/standalone run:
+-- Requires -v schema=<name> -v app_database=<name> — the latter is the
+-- application database name on the source instances (config.yaml's
+-- job.runs_in), used to filter pg_stat_database rows down to that one
+-- database instead of every database on the instance. deploy.py passes
+-- both automatically; for a manual/standalone run:
 --
---   psql <connection target> -v app_database=<app_db_name> -f 06_reports.sql
+--   psql <connection target> -v schema=stats_collect -v app_database=<app_db_name> -f 06_reports.sql
 --
 -- Reporting views: historical (trend across jobs) and synthetic
 -- (latest-job snapshot per instance). Some historical views come in a
@@ -15,7 +15,7 @@
 -- aggregation), and the same name without the suffix formatted for
 -- direct reading, built on top of "_raw" so the two can't drift apart.
 -- =====================================================================
-SET search_path = stats_collect;
+SET search_path = :"schema";
 
 -- ---------------------------------------------------------------------
 -- Job run history, per instance (each instance in a job gets its own
