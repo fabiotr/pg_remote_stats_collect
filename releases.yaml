@@ -39,3 +39,13 @@ releases:
       server_version_num, fetched via dblink every run), replacing
       instance_config.pg_version.
     migration: migrations/0002_stat_collect_job_per_instance.sql
+
+  - version: "0.2.1"
+    description: >-
+      Fix: 0002's migration now backfills stat_collect_job.version
+      from instance_config.pg_version (parsed into server_version_num's
+      encoding) before dropping that column, instead of leaving version
+      NULL for every migrated row. Nothing to run here directly --
+      already folded into 0002 itself, so any environment applying it
+      from now on gets the fix automatically.
+    migration: null
