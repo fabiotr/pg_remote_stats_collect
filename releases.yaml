@@ -23,7 +23,7 @@
 # -- both must independently arrive at the same end state, one for
 # fresh deploys, one for catching up an existing one.
 releases:
-  - version: "1.0.0"
+  - version: "0.1.0"
     description: >-
       Baseline: FDW + dblink cross-instance stats collection
       (11 hist_* tables), 13 rpt_* historical/synthetic reporting
@@ -31,7 +31,7 @@ releases:
       reconciler, --generate-calls).
     migration: null
 
-  - version: "1.1.0"
+  - version: "0.2.0"
     description: >-
       stat_collect_job now tracks one row per (job, instance) instead
       of one per job, with status/timing/errors independent per
