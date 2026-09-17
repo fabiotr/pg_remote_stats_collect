@@ -32,8 +32,14 @@
 -- original errors array intact, for reference. Drop that table
 -- yourself once you've confirmed you don't need it.
 --
--- version is left NULL for every migrated row (it wasn't tracked
--- before this migration) -- new rows from now on will have it.
+-- version is backfilled from instance_config.pg_version, parsed from
+-- its "MAJOR.MINOR" text (e.g. "17.4") into the same encoding
+-- server_version_num uses (major * 10000 + minor, e.g. 170004 --
+-- verified empirically: PG 15.18 reports server_version_num 150018).
+-- Assumes pg_version is always exactly two dot-separated integers,
+-- true for every value config.yaml has ever held. Only left NULL for
+-- an instance with no matching instance_config row (shouldn't happen
+-- in practice).
 -- =====================================================================
 
 BEGIN;
@@ -95,7 +101,13 @@ ALTER TABLE stats_collect.hist_object_size                 ADD FOREIGN KEY (id_s
 ALTER TABLE stats_collect.hist_tables_size                 ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
 ALTER TABLE stats_collect.hist_index_poor                  ADD FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stats_collect.stat_collect_job (id, instance);
 
--- ---- 6. instance_config.pg_version is superseded by stat_collect_job.version ----
+-- ---- 6. Backfill version from instance_config.pg_version before it's dropped ----
+UPDATE stats_collect.stat_collect_job job
+SET version = split_part(ic.pg_version, '.', 1)::int * 10000 + split_part(ic.pg_version, '.', 2)::int
+FROM stats_collect.instance_config ic
+WHERE ic.instance = job.instance AND job.version IS NULL;
+
+-- ---- 7. instance_config.pg_version is superseded by stat_collect_job.version ----
 ALTER TABLE stats_collect.instance_config DROP COLUMN pg_version;
 
 COMMIT;
