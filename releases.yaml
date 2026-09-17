@@ -49,3 +49,19 @@ releases:
       already folded into 0002 itself, so any environment applying it
       from now on gets the fix automatically.
     migration: null
+
+  - version: "0.3.0"
+    description: >-
+      Version-aware collection: setup_instance_fdw() now detects each
+      instance's actual server_version_num and pg_stat_statements
+      extversion via dblink and builds that instance's 7 foreign tables
+      with only the columns its version tier actually has (minimum
+      supported: PostgreSQL 10 / pg_stat_statements 1.6). collect_stats()
+      copies matching columns by name into the now-superset
+      hist_pg_stat_* tables (every column these views/pg_stat_statements
+      have had across PostgreSQL 10-19), NULLing anything a given
+      instance's version doesn't have -- this handles columns added AND
+      removed over time. Based on a full column-history research pass
+      covering PostgreSQL 8.4-19 and pg_stat_statements 1.0-1.13,
+      floored at 10/1.6 for the actually-supported range.
+    migration: migrations/0003_version_aware_columns.sql

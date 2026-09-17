@@ -13,6 +13,41 @@
 -- forbids COMMIT/ROLLBACK inside a procedure that has one. That's why
 -- every reference below is schema-qualified.
 
+-- Copies columns p_source_table and p_target_table have in common, by
+-- name; a target column the source doesn't have is inserted as NULL.
+-- Keeps this procedure version-agnostic -- setup_instance_fdw() is the
+-- only place that decides what an instance's foreign tables contain.
+CREATE OR REPLACE FUNCTION stats_collect.copy_matching_columns(
+    p_source_table text,
+    p_target_table text,
+    p_job_id bigint,
+    p_instance stats_collect.instance_name
+) RETURNS void
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    v_cols text;
+BEGIN
+    SELECT string_agg(
+        CASE WHEN fc.column_name IS NOT NULL THEN quote_ident(tc.column_name)
+             ELSE format('NULL::%s', tc.data_type)
+        END, ', ' ORDER BY tc.ordinal_position)
+    INTO v_cols
+    FROM information_schema.columns tc
+    LEFT JOIN information_schema.columns fc
+        ON fc.table_schema = 'stats_collect' AND fc.table_name = p_source_table
+            AND fc.column_name = tc.column_name
+    WHERE tc.table_schema = 'stats_collect' AND tc.table_name = p_target_table
+        AND tc.column_name NOT IN ('id_stat_collect_job', 'instance');
+
+    EXECUTE format(
+        'INSERT INTO stats_collect.%I SELECT %L::bigint, %L::stats_collect.instance_name, %s FROM stats_collect.%I',
+        p_target_table, p_job_id, p_instance::text, v_cols, p_source_table);
+END;
+$func$;
+
+ALTER FUNCTION stats_collect.copy_matching_columns(text, text, bigint, stats_collect.instance_name) OWNER TO stats_collect_owner;
+
 CREATE OR REPLACE PROCEDURE stats_collect.collect_stats()
 LANGUAGE plpgsql
 AS $proc$
@@ -42,33 +77,17 @@ BEGIN
             SELECT current_setting('server_version_num')::numeric
         $sql_version$) AS t(version numeric);
 
-        EXECUTE format(
-            'INSERT INTO stats_collect.hist_pg_stat_database SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
-            v_job_id, v_inst.instance::text, 'pg_stat_database_' || v_inst.instance);
+        PERFORM stats_collect.copy_matching_columns('pg_stat_database_' || v_inst.instance, 'hist_pg_stat_database', v_job_id, v_inst.instance);
+        PERFORM stats_collect.copy_matching_columns('pg_stat_database_conflicts_' || v_inst.instance, 'hist_pg_stat_database_conflicts', v_job_id, v_inst.instance);
+        PERFORM stats_collect.copy_matching_columns('pg_statio_all_tables_' || v_inst.instance, 'hist_pg_statio_all_tables', v_job_id, v_inst.instance);
+        PERFORM stats_collect.copy_matching_columns('pg_statio_all_indexes_' || v_inst.instance, 'hist_pg_statio_all_indexes', v_job_id, v_inst.instance);
+        PERFORM stats_collect.copy_matching_columns('pg_stat_all_tables_' || v_inst.instance, 'hist_pg_stat_all_tables', v_job_id, v_inst.instance);
+        PERFORM stats_collect.copy_matching_columns('pg_stat_statements_' || v_inst.instance, 'hist_pg_stat_statements', v_job_id, v_inst.instance);
 
-        EXECUTE format(
-            'INSERT INTO stats_collect.hist_pg_stat_database_conflicts SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
-            v_job_id, v_inst.instance::text, 'pg_stat_database_conflicts_' || v_inst.instance);
-
-        EXECUTE format(
-            'INSERT INTO stats_collect.hist_pg_statio_all_tables SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
-            v_job_id, v_inst.instance::text, 'pg_statio_all_tables_' || v_inst.instance);
-
-        EXECUTE format(
-            'INSERT INTO stats_collect.hist_pg_statio_all_indexes SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
-            v_job_id, v_inst.instance::text, 'pg_statio_all_indexes_' || v_inst.instance);
-
-        EXECUTE format(
-            'INSERT INTO stats_collect.hist_pg_stat_all_tables SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
-            v_job_id, v_inst.instance::text, 'pg_stat_all_tables_' || v_inst.instance);
-
-        EXECUTE format(
-            'INSERT INTO stats_collect.hist_pg_stat_statements SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
-            v_job_id, v_inst.instance::text, 'pg_stat_statements_' || v_inst.instance);
-
-        EXECUTE format(
-            'INSERT INTO stats_collect.hist_pg_stat_statements_info SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
-            v_job_id, v_inst.instance::text, 'pg_stat_statements_info_' || v_inst.instance);
+        -- skipped for a pre-1.9 instance -- setup_instance_fdw() never created it
+        IF to_regclass('stats_collect.' || quote_ident('pg_stat_statements_info_' || v_inst.instance)) IS NOT NULL THEN
+            PERFORM stats_collect.copy_matching_columns('pg_stat_statements_info_' || v_inst.instance, 'hist_pg_stat_statements_info', v_job_id, v_inst.instance);
+        END IF;
 
         -- ---- raw queries via dblink ----
 

@@ -2,7 +2,7 @@
 
 **Category:** Assessment (cross-instance historical monitoring)
 
-> **Version support:** this version's schema and foreign-table column lists are hardcoded against **PostgreSQL 17**. It has not been adapted for other major versions yet — every source instance and the central database need to be on 17 (patch version, e.g. 17.4 vs 17.9, is fine). Adding multi-version support is on the roadmap; see `stat_collect_job.version` (collected automatically on every run, not yet acted on by anything) and the note in `02_setup.sql`.
+> **Version support:** each source instance can run a different PostgreSQL version — `setup_instance_fdw()` detects it (and the `pg_stat_statements` extension version) via `dblink` and builds that instance's foreign tables with only the columns its version tier actually has. Minimum supported: PostgreSQL 10 / `pg_stat_statements` 1.6.
 
 A routine that periodically collects PostgreSQL statistics from any number of instances — via Foreign Data Wrapper, no per-instance manual connection required — and stores the history in one central database, so you can track trends over time (growing tables, index bloat, query regressions) instead of only ever seeing a point-in-time snapshot.
 
@@ -51,7 +51,7 @@ Either mode ends with a password summary — capture it into a password manager,
   - **Columns:** `instance`, `fdw_server`, `host`, `port`, `database_name`, `remote_user`, `cluster`, `instance_type`, `enabled`, `sys_prefix`, `notes`.
   - **`cluster`** — the instance's own name if it's a writer, or its writer's name if it's a reader (no separate is-writer flag needed).
   - **`instance_type`, `sys_prefix`, `notes`** — descriptive only; `collect_stats()` doesn't branch on them.
-- 7 tables mirroring `pg_stat_database`, `pg_stat_database_conflicts`, `pg_statio_all_tables`, `pg_statio_all_indexes`, `pg_stat_all_tables`, `pg_stat_statements`, `pg_stat_statements_info` — same columns as the source, plus `id_stat_collect_job` + `instance`.
+- 7 tables mirroring `pg_stat_database`, `pg_stat_database_conflicts`, `pg_statio_all_tables`, `pg_statio_all_indexes`, `pg_stat_all_tables`, `pg_stat_statements`, `pg_stat_statements_info`, plus `id_stat_collect_job` + `instance`. Each is the union of every column its source view has ever had (PostgreSQL 10-19), all nullable — `setup_instance_fdw()` gives each instance's foreign tables only the columns its version actually has, and `collect_stats()` matches columns by name (`copy_matching_columns()`), NULLing the rest.
 - 4 tables holding "raw" (unformatted) versions of four queries from [`pg_scripts`](https://github.com/fabiotr/pg_scripts)'s `sql/` directory — same logic/filters/`LIMIT` as `schemas_94up.sql`, `object_size_90up.sql`, `tables_size_95up.sql` and `index_poor_84up.sql`, with `pg_size_pretty`/`lpad`/`round(...)::text` replaced by the underlying numeric value: `hist_schemas`, `hist_object_size`, `hist_tables_size`, `hist_index_poor`.
 - 13 reporting views (`rpt_*`), historical and synthetic — see [Reports](#reports).
 
@@ -68,7 +68,7 @@ Read replicas of the same cluster share the writer's catalog and reject write st
 ### Collection procedure (`stats_collect.collect_stats()`)
 
 - Picks one job `id` (shared by every instance collected this run) and loops over every `enabled` row in `instance_config`.
-- For each instance: opens its own `stat_collect_job` row (`status = 'running'`) and commits immediately, then — wrapped in its own `BEGIN … EXCEPTION WHEN OTHERS` — fetches that instance's version via `dblink` and runs the 11 inserts. One instance's failure only discards that instance's data for the run — the rest continue. The error is recorded in that instance's own `stat_collect_job.errors`.
+- For each instance: opens its own `stat_collect_job` row (`status = 'running'`) and commits immediately, then — wrapped in its own `BEGIN … EXCEPTION WHEN OTHERS` — fetches that instance's version via `dblink` and runs the 11 inserts (the 7 stats-view copies via `copy_matching_columns()`, matching columns by name against that instance's foreign tables). One instance's failure only discards that instance's data for the run — the rest continue. The error is recorded in that instance's own `stat_collect_job.errors`.
 - `COMMIT`s after each instance, so a killed job keeps whatever was already collected.
 - `RAISE NOTICE` at every step, visible in an interactive `psql` session.
 - Closes each instance's own row `'succeeded'` or `'failed'`, independently — one instance failing doesn't affect another's status.

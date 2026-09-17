@@ -82,8 +82,18 @@ CREATE TABLE instance_config (
     notes         text
 );
 
--- 1) Direct copies of 7 stats views, same columns as the source, plus
---    id_stat_collect_job + instance.
+-- 1) 7 tables mirroring the source stats views, plus id_stat_collect_job
+--    + instance. Each is the union of every column its view has ever
+--    had (PostgreSQL 10-19; pg_stat_statements/_info by their own
+--    extension version, 1.6-1.13), all nullable -- setup_instance_fdw()
+--    gives each instance's foreign tables only the columns its version
+--    actually has, and collect_stats() matches columns by name,
+--    NULLing the rest (see copy_matching_columns() in
+--    04_collect_procedure.sql).
+--
+--    A column that changed meaning without changing name (e.g.
+--    n_tup_hot_upd narrowed in PG16) isn't split out here -- cross-check
+--    stat_collect_job.version for which semantics applied.
 CREATE TABLE hist_pg_stat_database (
     id_stat_collect_job bigint not null,
     instance             instance_name not null,
@@ -114,6 +124,8 @@ CREATE TABLE hist_pg_stat_database (
     sessions_abandoned   bigint,
     sessions_fatal       bigint,
     sessions_killed      bigint,
+    parallel_workers_to_launch bigint,
+    parallel_workers_launched  bigint,
     stats_reset          timestamptz,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
@@ -130,6 +142,7 @@ CREATE TABLE hist_pg_stat_database_conflicts (
     confl_bufferpin      bigint,
     confl_deadlock       bigint,
     confl_active_logicalslot bigint,
+    stats_reset          timestamptz,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_database_conflicts (instance, id_stat_collect_job);
@@ -148,6 +161,7 @@ CREATE TABLE hist_pg_statio_all_tables (
     toast_blks_hit       bigint,
     tidx_blks_read       bigint,
     tidx_blks_hit        bigint,
+    stats_reset          timestamptz,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_statio_all_tables (instance, id_stat_collect_job);
@@ -162,6 +176,7 @@ CREATE TABLE hist_pg_statio_all_indexes (
     indexrelname         name,
     idx_blks_read        bigint,
     idx_blks_hit         bigint,
+    stats_reset          timestamptz,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_statio_all_indexes (instance, id_stat_collect_job);
@@ -195,6 +210,11 @@ CREATE TABLE hist_pg_stat_all_tables (
     autovacuum_count     bigint,
     analyze_count        bigint,
     autoanalyze_count    bigint,
+    total_vacuum_time      double precision,
+    total_autovacuum_time  double precision,
+    total_analyze_time     double precision,
+    total_autoanalyze_time double precision,
+    stats_reset          timestamptz,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_all_tables (instance, id_stat_collect_job);
@@ -208,6 +228,12 @@ CREATE TABLE hist_pg_stat_statements (
     queryid              bigint,
     query                text,
     plans                bigint,
+    -- pre-1.8 (PG10-12) only; split into total_plan/exec_time below
+    total_time           double precision,
+    min_time             double precision,
+    max_time             double precision,
+    mean_time            double precision,
+    stddev_time          double precision,
     total_plan_time      double precision,
     min_plan_time        double precision,
     max_plan_time        double precision,
@@ -230,6 +256,9 @@ CREATE TABLE hist_pg_stat_statements (
     local_blks_written   bigint,
     temp_blks_read       bigint,
     temp_blks_written    bigint,
+    -- pre-1.11 (through PG16) only; split into shared/local_blk_* below
+    blk_read_time        double precision,
+    blk_write_time       double precision,
     shared_blk_read_time double precision,
     shared_blk_write_time double precision,
     local_blk_read_time  double precision,
@@ -251,6 +280,11 @@ CREATE TABLE hist_pg_stat_statements (
     jit_deform_time      double precision,
     stats_since          timestamptz,
     minmax_stats_since   timestamptz,
+    wal_buffers_full     bigint,
+    parallel_workers_to_launch bigint,
+    parallel_workers_launched  bigint,
+    generic_plan_calls   bigint,
+    custom_plan_calls    bigint,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_statements (instance, id_stat_collect_job);
