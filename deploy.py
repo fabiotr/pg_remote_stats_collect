@@ -19,6 +19,12 @@ against a fresh (or partially fresh) environment.
      08_reports_ownership.sql (with -v owner_role=<owner_role>),
      07_delete_collection.sql.
 
+Right after step 2, every release in releases.yaml (this project's
+version) is stamped into stats_collect.schema_releases at once,
+deployed_at = now(): 01..08 already build the schema at the latest
+release directly, so a fresh deploy has nothing to migrate, only to
+record.
+
 Every password generated is printed once at the end (grouped by remote
 user/database) -- capture it into a password manager, it's not stored.
 
@@ -55,6 +61,14 @@ Usage:
     Known edge case: removing every instance of a cluster while also
     adding a new one that reuses that same cluster name, in the same
     run, isn't handled -- split it into two separate --update runs.
+
+    ./deploy.py --migrate [config.yaml]
+    Already-deployed environment: brings its schema_releases up to date
+    with releases.yaml, running every release's migration
+    (migrations/NNNN_*.sql) newer than what's already recorded there,
+    in order, then recording it (creates schema_releases itself if it
+    doesn't exist yet). A release with no migration (the baseline) is
+    just recorded. No-op if already current.
 
 Requires: psql on PATH, PyYAML (`pip install pyyaml`).
 
@@ -144,7 +158,7 @@ def validate_writers(instances: list[dict], config_path: Path) -> None:
 
 
 def instance_config_values(inst: dict) -> str:
-    return "({instance}, {fdw_server}, {host}, {port}, {database_name}, {remote_user}, {cluster}, {instance_type}, {sys_prefix}, {pg_version}, {notes})".format(
+    return "({instance}, {fdw_server}, {host}, {port}, {database_name}, {remote_user}, {cluster}, {instance_type}, {sys_prefix}, {notes})".format(
         instance=sql_str(inst["name"]),
         fdw_server=sql_str(inst["fdw_server"]),
         host=sql_str(inst["host"]),
@@ -154,20 +168,19 @@ def instance_config_values(inst: dict) -> str:
         cluster=sql_str(inst["cluster"]),
         instance_type=sql_str(inst["instance_type"]),
         sys_prefix=sql_str(inst["sys_prefix"]),
-        pg_version=sql_str(str(inst["pg_version"])),
         notes=sql_str(inst["notes"]) if inst.get("notes") else "NULL",
     )
 
 
 INSTANCE_CONFIG_COLUMNS = (
-    "instance, fdw_server, host, port, database_name, remote_user, cluster, instance_type, sys_prefix, pg_version, notes"
+    "instance, fdw_server, host, port, database_name, remote_user, cluster, instance_type, sys_prefix, notes"
 )
 
 # Columns compared/read for --update's reconciliation (instance itself
 # is split out as the dict key -- see parse_live_instance_config).
 LIVE_INSTANCE_COLUMNS = (
     "fdw_server", "host", "port", "database_name", "remote_user",
-    "cluster", "instance_type", "sys_prefix", "pg_version", "enabled", "notes",
+    "cluster", "instance_type", "sys_prefix", "enabled", "notes",
 )
 
 # Which of the columns above affect the FDW objects (FOREIGN SERVER /
@@ -204,7 +217,7 @@ def instance_yaml_value(inst: dict, column: str) -> str:
         return "true" if inst.get("enabled", True) else "false"
     if column == "notes":
         return inst.get("notes") or ""
-    if column in ("port", "pg_version"):
+    if column == "port":
         return str(inst[column])
     return inst[column]
 
@@ -361,7 +374,6 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
             f"cluster = {sql_str(inst['cluster'])}, "
             f"instance_type = {sql_str(inst['instance_type'])}, "
             f"sys_prefix = {sql_str(inst['sys_prefix'])}, "
-            f"pg_version = {sql_str(str(inst['pg_version']))}, "
             f"enabled = {'true' if inst.get('enabled', True) else 'false'}, "
             f"notes = {sql_str(inst['notes']) if inst.get('notes') else 'NULL'} "
             f"WHERE instance = {sql_str(name)};",
@@ -463,13 +475,79 @@ def update_deploy(config_path: Path, cfg: dict) -> None:
         print_password_summary(password_summary)
 
 
+def load_releases() -> list[dict]:
+    """Reads releases.yaml -- the single source of truth for this
+    project's version, ordered oldest to newest."""
+    return yaml.safe_load(Path("releases.yaml").read_text())["releases"]
+
+
+def record_release(central_conn: str, version: str, description: str) -> None:
+    run_psql_command(
+        central_conn,
+        "INSERT INTO stats_collect.schema_releases (version, description) VALUES "
+        f"({sql_str(version)}, {sql_str(description.strip())});",
+    )
+
+
+def stamp_all_releases(central_conn: str) -> None:
+    """Fresh deploy only: 01_remote_setup.sql..08_reports_ownership.sql
+    already build the schema at releases.yaml's latest release directly,
+    so every release is simply recorded, deployed_at = now() for all."""
+    for release in load_releases():
+        record_release(central_conn, release["version"], release["description"])
+
+
+def migrate_deploy(central_conn: str, owner_role: str) -> None:
+    """--migrate: brings an already-deployed environment's
+    schema_releases up to date with releases.yaml, running every
+    release's migration (migrations/NNNN_*.sql) newer than what's
+    already recorded, in order, then recording it. A release with no
+    migration (the baseline) is just recorded. schema_releases itself
+    is created here if it doesn't exist yet -- true for any environment
+    deployed before this versioning system existed."""
+    run_psql_command(
+        central_conn,
+        "CREATE TABLE IF NOT EXISTS stats_collect.schema_releases ("
+        "version text primary key, "
+        "deployed_at timestamptz not null default clock_timestamp(), "
+        "description text not null);",
+    )
+    run_psql_command(
+        central_conn,
+        f"ALTER TABLE stats_collect.schema_releases OWNER TO {owner_role};",
+    )
+
+    live_versions = {
+        line.strip()
+        for line in run_psql_query(central_conn, "SELECT version FROM stats_collect.schema_releases;").splitlines()
+        if line.strip()
+    }
+
+    pending = [r for r in load_releases() if r["version"] not in live_versions]
+    if not pending:
+        print("==> Already at the latest release -- nothing to do.")
+        return
+
+    for release in pending:
+        version = release["version"]
+        migration = release.get("migration")
+        print(f"==> Applying release {version}: {release['description'].strip()}")
+        if migration:
+            run_psql_file(central_conn, migration)
+        record_release(central_conn, version, release["description"])
+        print(f"    - recorded in schema_releases")
+
+    print(f"==> Now at release {pending[-1]['version']}.")
+
+
 def main() -> None:
     argv = sys.argv[1:]
     generate_calls_only = "--generate-calls" in argv
     update_only = "--update" in argv
-    if generate_calls_only and update_only:
-        sys.exit("ERROR: pass only one of --generate-calls / --update")
-    argv = [a for a in argv if a not in ("--generate-calls", "--update")]
+    migrate_only = "--migrate" in argv
+    if sum([generate_calls_only, update_only, migrate_only]) > 1:
+        sys.exit("ERROR: pass only one of --generate-calls / --update / --migrate")
+    argv = [a for a in argv if a not in ("--generate-calls", "--update", "--migrate")]
 
     config_path = Path(argv[0] if argv else "config.yaml")
     if not config_path.is_file():
@@ -486,6 +564,10 @@ def main() -> None:
 
     if update_only:
         update_deploy(config_path, cfg)
+        return
+
+    if migrate_only:
+        migrate_deploy(central_conn, cfg["owner_role"])
         return
 
     schema = cfg["schema"]
@@ -535,6 +617,7 @@ def main() -> None:
         "-v", f"instance_name_values={instance_name_values}",
         "-f", "02_setup.sql",
     ])
+    stamp_all_releases(central_conn)
 
     print("==> Step 3/8: FDW procedure definition (03_fdw_setup.sql)")
     run_psql_file(central_conn, "03_fdw_setup.sql")

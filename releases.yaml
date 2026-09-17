@@ -1,0 +1,41 @@
+# Ordered oldest -> newest -- the single source of truth for this
+# project's version. The last entry here is the current version; it
+# should always match the latest tag on this project's git repo
+# (public and/or Storyblok mirror) once that release is propagated
+# there.
+#
+# deploy.py reads this file, never the other way around:
+#   - a fresh deploy (no flags) stamps every release below into
+#     stats_collect.schema_releases at once, deployed_at = now() --
+#     01_remote_setup.sql..08_reports_ownership.sql already build the
+#     schema at the latest release directly, so there's nothing to
+#     migrate, only to record.
+#   - `./deploy.py --migrate`, against an already-deployed environment,
+#     runs each release's `migration` (relative to this file, under
+#     migrations/) in order, for every release newer than the highest
+#     version already recorded in schema_releases, then records it.
+#     A release with `migration: null` (like the baseline below) is
+#     just recorded -- there's nothing to run.
+#
+# Adding a new release: bump this file (new entry, migration: the new
+# file under migrations/ implementing it), write that migration file,
+# and update 01-08 in place to already reflect the new schema directly
+# -- both must independently arrive at the same end state, one for
+# fresh deploys, one for catching up an existing one.
+releases:
+  - version: "1.0.0"
+    description: >-
+      Baseline: FDW + dblink cross-instance stats collection
+      (11 hist_* tables), 13 rpt_* historical/synthetic reporting
+      views, config.yaml-driven deploy.py (fresh deploy, --update
+      reconciler, --generate-calls).
+    migration: null
+
+  - version: "1.1.0"
+    description: >-
+      stat_collect_job now tracks one row per (job, instance) instead
+      of one per job, with status/timing/errors independent per
+      instance; it also gains a version column (each instance's
+      server_version_num, fetched via dblink every run), replacing
+      instance_config.pg_version.
+    migration: migrations/0002_stat_collect_job_per_instance.sql

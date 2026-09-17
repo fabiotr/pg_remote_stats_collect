@@ -22,10 +22,6 @@ central_service: central
 # instance_type: Writer, Reader or Other -- purely descriptive.
 # sys_prefix: groups instances expected to share the same objects
 # (schemas, tables, ...), independent of cluster/region.
-# pg_version: that instance's actual PostgreSQL server version (SHOW
-# server_version) -- always quote it (e.g. "17.10"), so YAML doesn't
-# parse it as a float and silently drop a trailing zero. Not read by
-# anything here yet; see the README's version-support caveat.
 # notes: optional free text, persisted to instance_config.notes as-is.
 instances:
   - name: main
@@ -37,7 +33,6 @@ instances:
     cluster: main
     instance_type: Writer
     sys_prefix: app
-    pg_version: "17.4"
     enabled: true
     notes: writer of the main cluster, shared with main_replica1/2
 
@@ -50,7 +45,6 @@ instances:
     cluster: main
     instance_type: Reader
     sys_prefix: app
-    pg_version: "17.4"
     enabled: true
 
   - name: main_replica2
@@ -62,7 +56,6 @@ instances:
     cluster: main
     instance_type: Reader
     sys_prefix: app
-    pg_version: "17.4"
     enabled: true
 
   - name: secondary
@@ -74,7 +67,6 @@ instances:
     cluster: secondary
     instance_type: Writer
     sys_prefix: app
-    pg_version: "17.4"
     enabled: true
     notes: standalone cluster, no reader endpoint
 
@@ -87,9 +79,8 @@ instances:
     cluster: archive
     instance_type: Writer
     sys_prefix: archive
-    pg_version: "16.4"
     enabled: true
-    notes: separate system -- different sys_prefix and pg_version on purpose, to show both fields in use
+    notes: separate system -- different sys_prefix on purpose, to show the field in use
 
 job:
   name: stats-collect-monthly

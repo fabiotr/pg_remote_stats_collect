@@ -1,12 +1,13 @@
 -- Run on the central stats database as admin.
 --   psql <connection target> -f 04_collect_procedure.sql
 --
--- Monthly job: opens a stat_collect_job row, loops over enabled
--- instances copying the 7 stats views (foreign table) and running 4
--- raw queries (dblink), then closes the job as succeeded/failed. Each
--- instance is atomic -- one instance's failure doesn't affect others,
--- and COMMITs after each instance keep progress visible and durable if
--- the job is interrupted partway.
+-- Monthly job: picks one job id shared by every instance this run,
+-- loops over enabled instances opening each its own stat_collect_job
+-- row, fetches its version, copies the 7 stats views (foreign table)
+-- and runs 4 raw queries (dblink), then closes that instance's row as
+-- succeeded/failed. Each instance is atomic -- one instance's failure
+-- doesn't affect others, and COMMITs after each instance keep progress
+-- visible and durable if the job is interrupted partway.
 --
 -- No SET clause (e.g. "SET search_path") on this procedure: Postgres
 -- forbids COMMIT/ROLLBACK inside a procedure that has one. That's why
@@ -18,20 +19,28 @@ AS $proc$
 DECLARE
     v_job_id    bigint;
     v_inst      record;
-    v_errors    text[] := '{}';
     v_inst_err  text;
+    v_version   numeric;
 BEGIN
-    INSERT INTO stats_collect.stat_collect_job (collect_start, status)
-    VALUES (clock_timestamp(), 'running')
-    RETURNING id INTO v_job_id;
-    COMMIT;
+    v_job_id := nextval(pg_get_serial_sequence('stats_collect.stat_collect_job', 'id'));
 
     RAISE NOTICE '[collect_stats] job % started', v_job_id;
 
     FOR v_inst IN SELECT * FROM stats_collect.instance_config WHERE enabled ORDER BY instance LOOP
         v_inst_err := NULL;
+        v_version := NULL;
         RAISE NOTICE '[collect_stats] % - starting', v_inst.instance;
+
+        INSERT INTO stats_collect.stat_collect_job (id, instance, collect_start, status)
+        VALUES (v_job_id, v_inst.instance, clock_timestamp(), 'running');
+        COMMIT;
+
         BEGIN
+
+        SELECT t.version INTO v_version
+        FROM stats_collect.dblink(v_inst.fdw_server, $sql_version$
+            SELECT current_setting('server_version_num')::numeric
+        $sql_version$) AS t(version numeric);
 
         EXECUTE format(
             'INSERT INTO stats_collect.hist_pg_stat_database SELECT %L::bigint, %L::stats_collect.instance_name, * FROM stats_collect.%I',
@@ -237,23 +246,22 @@ BEGIN
 
         IF v_inst_err IS NOT NULL THEN
             RAISE NOTICE '[collect_stats] % - FAILED: %', v_inst.instance, v_inst_err;
-            v_errors := v_errors || format('%s: %s', v_inst.instance, v_inst_err);
-            UPDATE stats_collect.stat_collect_job SET errors = v_errors WHERE id = v_job_id;
+            UPDATE stats_collect.stat_collect_job
+            SET collect_end = clock_timestamp(), status = 'failed', version = v_version, errors = ARRAY[v_inst_err]
+            WHERE id = v_job_id AND instance = v_inst.instance;
         ELSE
             RAISE NOTICE '[collect_stats] % - done', v_inst.instance;
+            UPDATE stats_collect.stat_collect_job
+            SET collect_end = clock_timestamp(), status = 'succeeded', version = v_version
+            WHERE id = v_job_id AND instance = v_inst.instance;
         END IF;
 
         COMMIT; -- outside the exception block above -- required
     END LOOP;
 
-    UPDATE stats_collect.stat_collect_job
-    SET collect_end = clock_timestamp(),
-        status = CASE WHEN v_errors = '{}' THEN 'succeeded'::stats_collect.job_status ELSE 'failed'::stats_collect.job_status END
-    WHERE id = v_job_id;
-    COMMIT;
-
     RAISE NOTICE '[collect_stats] job % finished - % instance(s) with errors',
-        v_job_id, coalesce(array_length(v_errors, 1), 0);
+        v_job_id,
+        (SELECT count(*) FROM stats_collect.stat_collect_job WHERE id = v_job_id AND status = 'failed');
 END;
 $proc$;
 

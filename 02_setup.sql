@@ -36,20 +36,38 @@ CREATE TYPE instance_type AS ENUM ('Writer', 'Reader', 'Other');
 
 CREATE TYPE job_status AS ENUM ('running', 'succeeded', 'failed');
 
+-- One row per project release -- see releases.yaml at the repo root,
+-- the single source of truth this table mirrors. Written only by
+-- deploy.py: a fresh deploy stamps every release in releases.yaml at
+-- once (nothing to migrate, only to record); `./deploy.py --migrate`
+-- on an already-deployed environment runs each pending release's
+-- migration (migrations/NNNN_*.sql) in order, then records it.
+CREATE TABLE schema_releases (
+    version     text primary key,
+    deployed_at timestamptz not null default clock_timestamp(),
+    description text not null
+);
+
+-- One row per (collection run, instance) -- collect_stats() gives
+-- every instance it collects its own row under the same job id, so
+-- status/timing/errors are tracked independently per instance instead
+-- of once for the whole run. version is that instance's
+-- server_version_num, fetched via dblink at collection time.
 CREATE TABLE stat_collect_job (
-    id serial primary key,
+    id            serial,
+    instance      instance_name not null,
+    version       numeric,
     collect_start timestamp,
     collect_end   timestamp,
     status        job_status,
-    errors        text[]
+    errors        text[],
+    PRIMARY KEY (id, instance)
 );
 
 -- cluster: the instance's own name if it's a writer, or its writer's
 -- name if it's a reader -- a writer always has cluster = instance.
 -- sys_prefix: groups instances expected to share the same objects,
 -- independent of cluster/region.
--- pg_version: tracked for future version-aware handling; not consumed
--- by anything in this routine yet -- see README.
 CREATE TABLE instance_config (
     instance      instance_name primary key,
     fdw_server    name not null,
@@ -61,14 +79,13 @@ CREATE TABLE instance_config (
     instance_type instance_type not null,
     enabled       boolean not null default true,
     sys_prefix    text not null,
-    pg_version    text not null,
     notes         text
 );
 
 -- 1) Direct copies of 7 stats views, same columns as the source, plus
 --    id_stat_collect_job + instance.
 CREATE TABLE hist_pg_stat_database (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     datid                oid,
     datname              name,
@@ -97,12 +114,13 @@ CREATE TABLE hist_pg_stat_database (
     sessions_abandoned   bigint,
     sessions_fatal       bigint,
     sessions_killed      bigint,
-    stats_reset          timestamptz
+    stats_reset          timestamptz,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_database (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_stat_database_conflicts (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     datid                oid,
     datname              name,
@@ -111,12 +129,13 @@ CREATE TABLE hist_pg_stat_database_conflicts (
     confl_snapshot       bigint,
     confl_bufferpin      bigint,
     confl_deadlock       bigint,
-    confl_active_logicalslot bigint
+    confl_active_logicalslot bigint,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_database_conflicts (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_statio_all_tables (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     relid                oid,
     schemaname           name,
@@ -128,12 +147,13 @@ CREATE TABLE hist_pg_statio_all_tables (
     toast_blks_read      bigint,
     toast_blks_hit       bigint,
     tidx_blks_read       bigint,
-    tidx_blks_hit        bigint
+    tidx_blks_hit        bigint,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_statio_all_tables (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_statio_all_indexes (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     relid                oid,
     indexrelid           oid,
@@ -141,12 +161,13 @@ CREATE TABLE hist_pg_statio_all_indexes (
     relname              name,
     indexrelname         name,
     idx_blks_read        bigint,
-    idx_blks_hit         bigint
+    idx_blks_hit         bigint,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_statio_all_indexes (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_stat_all_tables (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     relid                oid,
     schemaname           name,
@@ -173,12 +194,13 @@ CREATE TABLE hist_pg_stat_all_tables (
     vacuum_count         bigint,
     autovacuum_count     bigint,
     analyze_count        bigint,
-    autoanalyze_count    bigint
+    autoanalyze_count    bigint,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_all_tables (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_stat_statements (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     userid               oid,
     dbid                 oid,
@@ -228,16 +250,18 @@ CREATE TABLE hist_pg_stat_statements (
     jit_deform_count     bigint,
     jit_deform_time      double precision,
     stats_since          timestamptz,
-    minmax_stats_since   timestamptz
+    minmax_stats_since   timestamptz,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_statements (instance, id_stat_collect_job);
 CREATE INDEX ON hist_pg_stat_statements (queryid);
 
 CREATE TABLE hist_pg_stat_statements_info (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     dealloc              bigint,
-    stats_reset          timestamptz
+    stats_reset          timestamptz,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_pg_stat_statements_info (instance, id_stat_collect_job);
 
@@ -247,7 +271,7 @@ CREATE INDEX ON hist_pg_stat_statements_info (instance, id_stat_collect_job);
 
 -- schemas_94up.sql
 CREATE TABLE hist_schemas (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     nspname              name,
     size                 bigint,
@@ -261,13 +285,14 @@ CREATE TABLE hist_schemas (
     sequences            bigint,
     views                bigint,
     types                bigint,
-    foreign_tables       bigint
+    foreign_tables       bigint,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_schemas (instance, id_stat_collect_job);
 
 -- object_size_90up.sql (top 20 largest objects)
 CREATE TABLE hist_object_size (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     tablespace           text,
     schema               name,
@@ -275,13 +300,14 @@ CREATE TABLE hist_object_size (
     type                 text,
     owner                name,
     size                 bigint,
-    rows                 real
+    rows                 real,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_object_size (instance, id_stat_collect_job);
 
 -- tables_size_95up.sql (top 10 largest tables)
 CREATE TABLE hist_tables_size (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     tablespace           text,
     schema               name,
@@ -297,13 +323,14 @@ CREATE TABLE hist_tables_size (
     toast_size           bigint,
     toast_size_pct       numeric,
     rows                 real,
-    avg_row_size         numeric
+    avg_row_size         numeric,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_tables_size (instance, id_stat_collect_job);
 
 -- index_poor_84up.sql (top 20 problematic indexes)
 CREATE TABLE hist_index_poor (
-    id_stat_collect_job bigint not null references stat_collect_job(id),
+    id_stat_collect_job bigint not null,
     instance             instance_name not null,
     reason               text,
     schemaname           name,
@@ -317,7 +344,8 @@ CREATE TABLE hist_index_poor (
     index_size           bigint,
     table_size           bigint,
     idx_is_btree         boolean,
-    grp                  int
+    grp                  int,
+    FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_index_poor (instance, id_stat_collect_job);
 
@@ -331,7 +359,7 @@ DECLARE
     v_tbl text;
 BEGIN
     FOREACH v_tbl IN ARRAY ARRAY[
-        'stat_collect_job', 'instance_config',
+        'schema_releases', 'stat_collect_job', 'instance_config',
         'hist_pg_stat_database', 'hist_pg_stat_database_conflicts',
         'hist_pg_statio_all_tables', 'hist_pg_statio_all_indexes',
         'hist_pg_stat_all_tables', 'hist_pg_stat_statements', 'hist_pg_stat_statements_info',

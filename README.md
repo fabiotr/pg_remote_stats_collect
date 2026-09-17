@@ -2,7 +2,7 @@
 
 **Category:** Assessment (cross-instance historical monitoring)
 
-> **Version support:** this version's schema and foreign-table column lists are hardcoded against **PostgreSQL 17**. It has not been adapted for other major versions yet — every source instance and the central database need to be on 17 (patch version, e.g. 17.4 vs 17.9, is fine). Adding multi-version support is on the roadmap; see `instance_config.pg_version` (tracked today, not yet acted on by anything) and the note in `02_setup.sql`.
+> **Version support:** this version's schema and foreign-table column lists are hardcoded against **PostgreSQL 17**. It has not been adapted for other major versions yet — every source instance and the central database need to be on 17 (patch version, e.g. 17.4 vs 17.9, is fine). Adding multi-version support is on the roadmap; see `stat_collect_job.version` (collected automatically on every run, not yet acted on by anything) and the note in `02_setup.sql`.
 
 A routine that periodically collects PostgreSQL statistics from any number of instances — via Foreign Data Wrapper, no per-instance manual connection required — and stores the history in one central database, so you can track trends over time (growing tables, index bloat, query regressions) instead of only ever seeing a point-in-time snapshot.
 
@@ -31,6 +31,7 @@ It's a fresh-environment tool, not an idempotent reconciler — re-running it ag
 
 - **Reconcile it with the current `config.yaml`:** `./deploy.py --update` — adds instances newly listed, removes ones no longer listed (dropping their FDW objects, and the remote role too if it was the last instance on that cluster), and updates the rest to match (see its docstring for the details and one known edge case).
 - **Just want the commands, not run for you:** `./deploy.py --generate-calls` — regenerates the FDW setup calls for whatever's currently in `instance_config`, printed for you to review.
+- **Catch its schema up with `releases.yaml`:** `./deploy.py --migrate` — see [Versioning](#versioning-releasesyaml).
 
 Either mode ends with a password summary — capture it into a password manager, it's shown once and never stored.
 
@@ -44,11 +45,12 @@ Either mode ends with a password summary — capture it into a password manager,
 ### Schema layout (`stats_collect`)
 
 - `instance_name` — enum of every instance you monitor, built from `config.yaml`'s `instances[]` by `deploy.py`.
-- `stat_collect_job` — one row per collection run: `id`, `collect_start`, `collect_end`, `status` (`running`/`succeeded`/`failed`), `errors`.
+- `schema_releases` — one row per project release: `version` (primary key, semver, matches [`releases.yaml`](releases.yaml)), `deployed_at`, `description`. See [Versioning](#versioning-releasesyaml).
+- `stat_collect_job` — one row per (collection run, **instance**): `id` + `instance` (composite primary key), `version` (that instance's `server_version_num`, fetched via `dblink` at collection time), `collect_start`, `collect_end`, `status` (`running`/`succeeded`/`failed`), `errors` (that instance's own error, if any). Every instance in a run shares the same `id` but gets its own row, so status/timing/errors are tracked independently per instance.
 - `instance_config` — which instances participate and how to reach each one; the single source of truth `setup_instance_fdw()` reads from. Populated from `config.yaml` by `deploy.py`.
-  - **Columns:** `instance`, `fdw_server`, `host`, `port`, `database_name`, `remote_user`, `cluster`, `instance_type`, `enabled`, `sys_prefix`, `pg_version`, `notes`.
+  - **Columns:** `instance`, `fdw_server`, `host`, `port`, `database_name`, `remote_user`, `cluster`, `instance_type`, `enabled`, `sys_prefix`, `notes`.
   - **`cluster`** — the instance's own name if it's a writer, or its writer's name if it's a reader (no separate is-writer flag needed).
-  - **`instance_type`, `sys_prefix`, `pg_version`, `notes`** — descriptive only; `collect_stats()` doesn't branch on them.
+  - **`instance_type`, `sys_prefix`, `notes`** — descriptive only; `collect_stats()` doesn't branch on them.
 - 7 tables mirroring `pg_stat_database`, `pg_stat_database_conflicts`, `pg_statio_all_tables`, `pg_statio_all_indexes`, `pg_stat_all_tables`, `pg_stat_statements`, `pg_stat_statements_info` — same columns as the source, plus `id_stat_collect_job` + `instance`.
 - 4 tables holding "raw" (unformatted) versions of four queries from [`pg_scripts`](https://github.com/fabiotr/pg_scripts)'s `sql/` directory — same logic/filters/`LIMIT` as `schemas_94up.sql`, `object_size_90up.sql`, `tables_size_95up.sql` and `index_poor_84up.sql`, with `pg_size_pretty`/`lpad`/`round(...)::text` replaced by the underlying numeric value: `hist_schemas`, `hist_object_size`, `hist_tables_size`, `hist_index_poor`.
 - 13 reporting views (`rpt_*`), historical and synthetic — see [Reports](#reports).
@@ -65,11 +67,11 @@ Read replicas of the same cluster share the writer's catalog and reject write st
 
 ### Collection procedure (`stats_collect.collect_stats()`)
 
-- Opens a `stat_collect_job` row (`status = 'running'`) and commits immediately.
-- Loops over every `enabled` row in `instance_config`, each wrapped in its own `BEGIN … EXCEPTION WHEN OTHERS`: one instance's failure only discards that instance's data for the run — the rest continue. The error is appended to `stat_collect_job.errors`.
+- Picks one job `id` (shared by every instance collected this run) and loops over every `enabled` row in `instance_config`.
+- For each instance: opens its own `stat_collect_job` row (`status = 'running'`) and commits immediately, then — wrapped in its own `BEGIN … EXCEPTION WHEN OTHERS` — fetches that instance's version via `dblink` and runs the 11 inserts. One instance's failure only discards that instance's data for the run — the rest continue. The error is recorded in that instance's own `stat_collect_job.errors`.
 - `COMMIT`s after each instance, so a killed job keeps whatever was already collected.
 - `RAISE NOTICE` at every step, visible in an interactive `psql` session.
-- Ends `'succeeded'` only if `errors` is empty; otherwise `'failed'`, even if most instances succeeded.
+- Closes each instance's own row `'succeeded'` or `'failed'`, independently — one instance failing doesn't affect another's status.
 
 **Design constraint:** this procedure can't have a `SET` clause or be `SECURITY DEFINER` — PostgreSQL rejects internal `COMMIT`/`ROLLBACK` in both cases. That's why every reference inside it is schema-qualified instead of relying on `search_path`, and why it stays `SECURITY INVOKER` — `pg_cron` already runs it as `stats_collect_owner`.
 
@@ -77,11 +79,20 @@ Read replicas of the same cluster share the writer's catalog and reject write st
 
 `pg_cron`'s metadata always lives in the `postgres` database on RDS/Aurora, regardless of which database the job should run in. Per AWS's documented procedure ([scheduling a cron job for a database other than the default](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_pg_cron.html#PostgreSQL_pg_cron.otherDB)): the extension is created in `postgres`, the job is scheduled there with `cron.schedule(...)`, then `UPDATE cron.job` redirects it to the target database/role. Off RDS/Aurora, `cron.schedule_in_database(...)` does this in one call.
 
+### Versioning ([`releases.yaml`](releases.yaml))
+
+This project's version — the single source of truth is `releases.yaml`'s last entry, which should always match the latest tag on this repo once that release is published. Every release also gets a row in `schema_releases`, written only by `deploy.py`, never by hand:
+
+- **A fresh deploy** (`./deploy.py`, no flags) stamps every release in `releases.yaml` into `schema_releases` at once, `deployed_at = now()` for each — `01_remote_setup.sql`..`08_reports_ownership.sql` already build the schema at the latest release directly, so there's nothing to migrate, only to record.
+- **`./deploy.py --migrate`**, against an already-deployed environment, runs every release's migration (`migrations/NNNN_*.sql`, referenced by that release's `migration:` key in `releases.yaml`) that's newer than the highest version already recorded in `schema_releases`, in order, then records it. A release with `migration: null` (like the baseline) is just recorded. Creates `schema_releases` itself if it doesn't exist yet — true for any environment deployed before this versioning system existed. A no-op if already current.
+
+Adding a new release: bump `releases.yaml` (new entry, `migration:` pointing at a new file under `migrations/`), write that migration, and update `01_remote_setup.sql`..`08_reports_ownership.sql` in place to already reflect the new schema directly — both must independently arrive at the same end state, one for fresh deploys, one for catching up an existing environment.
+
 ### Reports
 
 | View | Kind | What it shows |
 |---|---|---|
-| `rpt_job_history` | historical | every job run, with duration |
+| `rpt_job_history` | historical | every job run, per instance, with status, version and duration |
 | `rpt_db_activity_history_raw` | historical | same as below, plain numeric (temp_bytes in bytes) — for further processing rather than direct reading |
 | `rpt_db_activity_history` | historical | connections, commit/rollback, cache hit %, temp files, deadlocks per instance over time, formatted for direct reading |
 | `rpt_schema_growth_history_raw` | historical | same as below, plain numeric (size in bytes) — for further processing rather than direct reading |
@@ -125,7 +136,7 @@ Run each statement separately — combining them into one multi-statement comman
 **Check the outcome:**
 
 ```sql
-SELECT * FROM stats_collect.stat_collect_job ORDER BY id DESC LIMIT 1;
+SELECT * FROM stats_collect.stat_collect_job WHERE id = (SELECT max(id) FROM stats_collect.stat_collect_job);
 ```
 
 **Delete a bad or test collection:**
@@ -145,6 +156,7 @@ Beyond `collect_stats()` and `setup_instance_fdw()` (both covered above), these 
 | `stats_collect.delete_collection(p_job_id bigint)` | central db, SQL function | Deletes one collection's rows from all 11 `hist_*` tables plus its `stat_collect_job` row — see [Common operations](#common-operations). |
 | `./deploy.py --update [config.yaml]` | CLI | Reconciles the live `instance_config` with `config.yaml` — adds, removes, and updates instances as needed. |
 | `./deploy.py --generate-calls [config.yaml]` | CLI | Prints (doesn't run) the `01_remote_setup.sql`/`setup_instance_fdw()` commands for whatever's currently in `instance_config`. |
+| `./deploy.py --migrate [config.yaml]` | CLI | Brings an already-deployed environment's `schema_releases` up to date with `releases.yaml`. |
 
 ## License
 

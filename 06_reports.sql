@@ -18,13 +18,14 @@
 SET search_path = stats_collect;
 
 -- ---------------------------------------------------------------------
--- Job run history.
+-- Job run history, per instance (each instance in a job gets its own
+-- row, with its own status/timing -- see stat_collect_job in 02_setup.sql).
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE VIEW rpt_job_history AS
-SELECT id, collect_start, collect_end,
-       collect_end - collect_start AS duration
+SELECT id, instance, version, status, collect_start, collect_end,
+       collect_end - collect_start AS duration, errors
 FROM stat_collect_job
-ORDER BY collect_start DESC;
+ORDER BY collect_start DESC, instance;
 
 -- ---------------------------------------------------------------------
 -- Historical: database size and commit/rollback rate per instance,
@@ -44,7 +45,7 @@ SELECT
     d.deadlocks,
     d.conflicts
 FROM hist_pg_stat_database d
-    JOIN stat_collect_job j ON j.id = d.id_stat_collect_job
+    JOIN stat_collect_job j ON j.id = d.id_stat_collect_job AND j.instance = d.instance
     JOIN instance_config ic ON ic.instance = d.instance
 WHERE d.datname = ic.database_name
 ORDER BY j.collect_start DESC, d.instance;
@@ -76,7 +77,7 @@ SELECT
     h.size_pct,
     h.tables
 FROM hist_schemas h
-    JOIN stat_collect_job j ON j.id = h.id_stat_collect_job
+    JOIN stat_collect_job j ON j.id = h.id_stat_collect_job AND j.instance = h.instance
 ORDER BY j.collect_start DESC, h.size DESC;
 
 CREATE OR REPLACE VIEW rpt_schema_growth_history AS
@@ -138,7 +139,7 @@ history AS (
         h.rows,
         h.avg_row_size
     FROM hist_tables_size h
-        JOIN stat_collect_job j ON j.id = h.id_stat_collect_job
+        JOIN stat_collect_job j ON j.id = h.id_stat_collect_job AND j.instance = h.instance
         JOIN top_tables t ON t.instance = h.instance AND t.schema = h.schema AND t.name = h.name
 ),
 with_growth AS (
@@ -259,7 +260,7 @@ with_reset_days AS (
         j.collect_start::date AS collect_date,
         nullif(EXTRACT(EPOCH FROM (j.collect_start - i.stats_reset)) / 86400, 0) AS reset_days
     FROM totals t
-        JOIN stat_collect_job j ON j.id = t.id_stat_collect_job
+        JOIN stat_collect_job j ON j.id = t.id_stat_collect_job AND j.instance = t.instance
         JOIN hist_pg_stat_statements_info i
             ON i.id_stat_collect_job = t.id_stat_collect_job AND i.instance = t.instance
 )
@@ -313,7 +314,7 @@ SELECT
 FROM latest_job lj
     JOIN hist_pg_stat_database d
         ON d.instance = lj.instance AND d.id_stat_collect_job = lj.id_stat_collect_job AND d.datname = :'app_database'
-    JOIN stat_collect_job j ON j.id = lj.id_stat_collect_job
+    JOIN stat_collect_job j ON j.id = lj.id_stat_collect_job AND j.instance = lj.instance
 ORDER BY d.instance;
 
 -- ---------------------------------------------------------------------
