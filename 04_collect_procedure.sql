@@ -3,11 +3,13 @@
 --
 -- Monthly job: picks one job id shared by every instance this run,
 -- loops over enabled instances opening each its own stat_collect_job
--- row, fetches its version, copies the 7 stats views (foreign table)
--- and runs 4 raw queries (dblink), then closes that instance's row as
--- succeeded/failed. Each instance is atomic -- one instance's failure
--- doesn't affect others, and COMMITs after each instance keep progress
--- visible and durable if the job is interrupted partway.
+-- row, fetches its version, copies the 7 stats views (foreign table --
+-- pg_stat_statements capped to the top 100 rows by time spent, see
+-- copy_top_statements(); the other 6 copied in full) and runs 4 raw
+-- queries (dblink), then closes that instance's row as succeeded/failed.
+-- Each instance is atomic -- one instance's failure doesn't affect
+-- others, and COMMITs after each instance keep progress visible and
+-- durable if the job is interrupted partway.
 --
 -- No SET clause (e.g. "SET search_path") on this procedure: Postgres
 -- forbids COMMIT/ROLLBACK inside a procedure that has one. Instead it
@@ -54,6 +56,50 @@ $func$;
 
 ALTER FUNCTION :"schema".copy_matching_columns(text, text, bigint, :"schema".instance_name) OWNER TO stats_collect_owner;
 
+-- pg_stat_statements has one row per distinct query -- copying it in
+-- full grows hist_pg_stat_statements unboundedly. Instead, ranks the
+-- source by total time spent (total_plan_time + total_exec_time on
+-- extension 1.8+, total_time pre-1.8 -- same rename copy_matching_columns()
+-- already accounts for elsewhere) and keeps only the top p_limit rows.
+CREATE OR REPLACE FUNCTION :"schema".copy_top_statements(
+    p_source_table text,
+    p_job_id bigint,
+    p_instance :"schema".instance_name,
+    p_limit int DEFAULT 100
+) RETURNS void
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    v_schema    name := current_schema();
+    v_cols      text;
+    v_order_by  text;
+    v_has_split boolean;
+BEGIN
+    SELECT bool_or(column_name = 'total_plan_time') INTO v_has_split
+    FROM information_schema.columns
+    WHERE table_schema = v_schema AND table_name = p_source_table;
+    v_order_by := CASE WHEN v_has_split THEN 'total_plan_time + total_exec_time' ELSE 'total_time' END;
+
+    SELECT string_agg(
+        CASE WHEN fc.column_name IS NOT NULL THEN quote_ident(tc.column_name)
+             ELSE format('NULL::%s', tc.data_type)
+        END, ', ' ORDER BY tc.ordinal_position)
+    INTO v_cols
+    FROM information_schema.columns tc
+    LEFT JOIN information_schema.columns fc
+        ON fc.table_schema = v_schema AND fc.table_name = p_source_table
+            AND fc.column_name = tc.column_name
+    WHERE tc.table_schema = v_schema AND tc.table_name = 'hist_pg_stat_statements'
+        AND tc.column_name NOT IN ('id_stat_collect_job', 'instance');
+
+    EXECUTE format(
+        'INSERT INTO hist_pg_stat_statements SELECT %L::bigint, %L::%I.instance_name, %s FROM %I ORDER BY %s DESC NULLS LAST LIMIT %s',
+        p_job_id, p_instance::text, v_schema, v_cols, p_source_table, v_order_by, p_limit);
+END;
+$func$;
+
+ALTER FUNCTION :"schema".copy_top_statements(text, bigint, :"schema".instance_name, int) OWNER TO stats_collect_owner;
+
 CREATE OR REPLACE PROCEDURE :"schema".collect_stats()
 LANGUAGE plpgsql
 AS $proc$
@@ -94,7 +140,7 @@ BEGIN
         PERFORM copy_matching_columns('pg_statio_all_tables_' || v_inst.instance, 'hist_pg_statio_all_tables', v_job_id, v_inst.instance);
         PERFORM copy_matching_columns('pg_statio_all_indexes_' || v_inst.instance, 'hist_pg_statio_all_indexes', v_job_id, v_inst.instance);
         PERFORM copy_matching_columns('pg_stat_all_tables_' || v_inst.instance, 'hist_pg_stat_all_tables', v_job_id, v_inst.instance);
-        PERFORM copy_matching_columns('pg_stat_statements_' || v_inst.instance, 'hist_pg_stat_statements', v_job_id, v_inst.instance);
+        PERFORM copy_top_statements('pg_stat_statements_' || v_inst.instance, v_job_id, v_inst.instance);
 
         -- skipped for a pre-1.9 instance -- setup_instance_fdw() never created it
         IF to_regclass(quote_ident('pg_stat_statements_info_' || v_inst.instance)) IS NOT NULL THEN

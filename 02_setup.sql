@@ -222,6 +222,11 @@ CREATE TABLE hist_pg_stat_all_tables (
 );
 CREATE INDEX ON hist_pg_stat_all_tables (instance, id_stat_collect_job);
 
+-- Capped to the top 100 rows per instance per run, ranked by total
+-- time spent (total_plan_time + total_exec_time, or total_time on a
+-- pre-1.8 instance) -- see copy_top_statements() in
+-- 04_collect_procedure.sql. pg_stat_statements has one row per
+-- distinct query; copying it in full would grow this table unboundedly.
 CREATE TABLE hist_pg_stat_statements (
     id_stat_collect_job bigint not null,
     instance             instance_name not null,

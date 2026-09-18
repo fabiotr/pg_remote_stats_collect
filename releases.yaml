@@ -84,3 +84,16 @@ releases:
       without a full re-deploy. Nothing to migrate: existing objects
       already live in whichever schema they were created in.
     migration: null
+
+  - version: "0.5.0"
+    description: >-
+      pg_stat_statements collection capped to the top 100 rows per
+      instance per run, ranked by total time spent
+      (total_plan_time + total_exec_time on extension 1.8+, total_time
+      pre-1.8). Previously copied every row from the source view,
+      which grows hist_pg_stat_statements unboundedly since it has one
+      row per distinct query. New copy_top_statements() replaces the
+      copy_matching_columns() call for this one table only -- the
+      other 6 FDW-backed tables are unaffected. Nothing to migrate:
+      no column changes, only which rows get inserted going forward.
+    migration: null
