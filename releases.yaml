@@ -85,7 +85,7 @@ releases:
       already live in whichever schema they were created in.
     migration: null
 
-  - version: "0.5.0"
+  - version: "0.4.1"
     description: >-
       pg_stat_statements collection capped to the top 100 rows per
       instance per run, ranked by total time spent
