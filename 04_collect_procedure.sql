@@ -112,7 +112,7 @@ DECLARE
     v_version   numeric;
 BEGIN
     GET DIAGNOSTICS v_context = PG_CONTEXT;
-    v_schema := (regexp_match(v_context, 'function ([^.]+)\.'))[1];
+    v_schema := (regexp_match(v_context, E'function ([^.]+)\\.'))[1];
     EXECUTE format('SET search_path = %I', v_schema);
 
     v_job_id := nextval(pg_get_serial_sequence('stat_collect_job', 'id'));

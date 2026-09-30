@@ -215,7 +215,7 @@ DECLARE
     v_conninfo    text;
 BEGIN
     GET DIAGNOSTICS v_context = PG_CONTEXT;
-    v_schema := (regexp_match(v_context, 'function ([^.]+)\.'))[1];
+    v_schema := (regexp_match(v_context, E'function ([^.]+)\\.'))[1];
     EXECUTE format('SET search_path = %I', v_schema);
 
     SELECT fdw_server, host, port, database_name, remote_user
@@ -288,7 +288,7 @@ DECLARE
     v_pgss_minor int;
 BEGIN
     GET DIAGNOSTICS v_context = PG_CONTEXT;
-    v_schema := (regexp_match(v_context, 'function ([^.]+)\.'))[1];
+    v_schema := (regexp_match(v_context, E'function ([^.]+)\\.'))[1];
     EXECUTE format('SET search_path = %I', v_schema);
 
     SELECT fdw_server INTO v_server

@@ -46,9 +46,9 @@ CREATE TYPE job_status AS ENUM ('running', 'succeeded', 'failed');
 -- on an already-deployed environment runs each pending release's
 -- migration (migrations/NNNN_*.sql) in order, then records it.
 CREATE TABLE schema_releases (
-    version     text primary key,
-    deployed_at timestamptz not null default clock_timestamp(),
-    description text not null
+    version     text PRIMARY KEY,
+    deployed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    description text NOT NULL
 );
 
 -- One row per (collection run, instance) -- collect_stats() gives
@@ -58,7 +58,7 @@ CREATE TABLE schema_releases (
 -- server_version_num, fetched via dblink at collection time.
 CREATE TABLE stat_collect_job (
     id            serial,
-    instance      instance_name not null,
+    instance      instance_name NOT NULL,
     version       numeric,
     collect_start timestamp,
     collect_end   timestamp,
@@ -72,16 +72,16 @@ CREATE TABLE stat_collect_job (
 -- sys_prefix: groups instances expected to share the same objects,
 -- independent of cluster/region.
 CREATE TABLE instance_config (
-    instance      instance_name primary key,
-    fdw_server    name not null,
-    host          text not null,
-    port          int not null default 5432,
-    database_name text not null,
-    remote_user   text not null,
-    cluster       instance_name not null,
-    instance_type instance_type not null,
-    enabled       boolean not null default true,
-    sys_prefix    text not null,
+    instance      instance_name PRIMARY KEY,
+    fdw_server    name NOT NULL,
+    host          text NOT NULL,
+    port          int NOT NULL DEFAULT 5432,
+    database_name text NOT NULL,
+    remote_user   text NOT NULL,
+    cluster       instance_name NOT NULL,
+    instance_type instance_type NOT NULL,
+    enabled       boolean NOT NULL DEFAULT TRUE,
+    sys_prefix    text NOT NULL,
     notes         text
 );
 
@@ -98,8 +98,8 @@ CREATE TABLE instance_config (
 --    n_tup_hot_upd narrowed in PG16) isn't split out here -- cross-check
 --    stat_collect_job.version for which semantics applied.
 CREATE TABLE hist_pg_stat_database (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     datid                oid,
     datname              name,
     numbackends          integer,
@@ -135,8 +135,8 @@ CREATE TABLE hist_pg_stat_database (
 CREATE INDEX ON hist_pg_stat_database (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_stat_database_conflicts (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     datid                oid,
     datname              name,
     confl_tablespace     bigint,
@@ -151,8 +151,8 @@ CREATE TABLE hist_pg_stat_database_conflicts (
 CREATE INDEX ON hist_pg_stat_database_conflicts (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_statio_all_tables (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     relid                oid,
     schemaname           name,
     relname              name,
@@ -170,8 +170,8 @@ CREATE TABLE hist_pg_statio_all_tables (
 CREATE INDEX ON hist_pg_statio_all_tables (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_statio_all_indexes (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     relid                oid,
     indexrelid           oid,
     schemaname           name,
@@ -185,8 +185,8 @@ CREATE TABLE hist_pg_statio_all_indexes (
 CREATE INDEX ON hist_pg_statio_all_indexes (instance, id_stat_collect_job);
 
 CREATE TABLE hist_pg_stat_all_tables (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     relid                oid,
     schemaname           name,
     relname              name,
@@ -228,8 +228,8 @@ CREATE INDEX ON hist_pg_stat_all_tables (instance, id_stat_collect_job);
 -- 04_collect_procedure.sql. pg_stat_statements has one row per
 -- distinct query; copying it in full would grow this table unboundedly.
 CREATE TABLE hist_pg_stat_statements (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     userid               oid,
     dbid                 oid,
     toplevel             boolean,
@@ -299,8 +299,8 @@ CREATE INDEX ON hist_pg_stat_statements (instance, id_stat_collect_job);
 CREATE INDEX ON hist_pg_stat_statements (queryid);
 
 CREATE TABLE hist_pg_stat_statements_info (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     dealloc              bigint,
     stats_reset          timestamptz,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
@@ -313,8 +313,8 @@ CREATE INDEX ON hist_pg_stat_statements_info (instance, id_stat_collect_job);
 
 -- schemas_94up.sql
 CREATE TABLE hist_schemas (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     nspname              name,
     size                 bigint,
     size_pct             numeric,
@@ -334,8 +334,8 @@ CREATE INDEX ON hist_schemas (instance, id_stat_collect_job);
 
 -- object_size_90up.sql (top 20 largest objects)
 CREATE TABLE hist_object_size (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     tablespace           text,
     schema               name,
     name                 name,
@@ -349,8 +349,8 @@ CREATE INDEX ON hist_object_size (instance, id_stat_collect_job);
 
 -- tables_size_95up.sql (top 10 largest tables)
 CREATE TABLE hist_tables_size (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     tablespace           text,
     schema               name,
     name                 name,
@@ -372,8 +372,8 @@ CREATE INDEX ON hist_tables_size (instance, id_stat_collect_job);
 
 -- index_poor_84up.sql (top 20 problematic indexes)
 CREATE TABLE hist_index_poor (
-    id_stat_collect_job bigint not null,
-    instance             instance_name not null,
+    id_stat_collect_job bigint NOT NULL,
+    instance             instance_name NOT NULL,
     reason               text,
     schemaname           name,
     tablename            name,

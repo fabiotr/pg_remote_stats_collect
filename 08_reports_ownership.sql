@@ -24,7 +24,7 @@ DECLARE
 BEGIN
     FOR v_view IN
         SELECT viewname FROM pg_views
-        WHERE schemaname = v_schema AND viewname LIKE 'rpt\_%' ESCAPE '\'
+        WHERE schemaname = v_schema AND viewname LIKE 'rpt!_%' ESCAPE '!'
     LOOP
         EXECUTE format('ALTER VIEW %I.%I OWNER TO %I', v_schema, v_view, v_owner);
     END LOOP;

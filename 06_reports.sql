@@ -258,7 +258,7 @@ with_reset_days AS (
     SELECT
         t.*,
         j.collect_start::date AS collect_date,
-        nullif(EXTRACT(EPOCH FROM (j.collect_start - i.stats_reset)) / 86400, 0) AS reset_days
+        nullif(EXTRACT(epoch FROM (j.collect_start - i.stats_reset)) / 86400, 0) AS reset_days
     FROM totals t
         JOIN stat_collect_job j ON j.id = t.id_stat_collect_job AND j.instance = t.instance
         JOIN hist_pg_stat_statements_info i
