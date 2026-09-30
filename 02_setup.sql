@@ -46,7 +46,7 @@ CREATE TYPE job_status AS ENUM ('running', 'succeeded', 'failed');
 -- on an already-deployed environment runs each pending release's
 -- migration (migrations/NNNN_*.sql) in order, then records it.
 CREATE TABLE schema_releases (
-    version     text PRIMARY key,
+    version     text PRIMARY KEY,
     deployed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     description text NOT NULL
 );
@@ -72,7 +72,7 @@ CREATE TABLE stat_collect_job (
 -- sys_prefix: groups instances expected to share the same objects,
 -- independent of cluster/region.
 CREATE TABLE instance_config (
-    instance      instance_name PRIMARY key,
+    instance      instance_name PRIMARY KEY,
     fdw_server    name NOT NULL,
     host          text NOT NULL,
     port          int NOT NULL DEFAULT 5432,

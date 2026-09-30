@@ -18,7 +18,7 @@ BEGIN
     -- header) rather than hardcoding it, so this file works under any
     -- -v schema= value without further changes to its body.
     GET DIAGNOSTICS v_context = PG_CONTEXT;
-    v_schema := (regexp_match(v_context, 'function ([^.]+)\.'))[1];
+    v_schema := (regexp_match(v_context, E'function ([^.]+)\\.'))[1];
     EXECUTE format('SET search_path = %I', v_schema);
 
     FOREACH v_tbl IN ARRAY ARRAY[
