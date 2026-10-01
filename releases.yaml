@@ -97,3 +97,18 @@ releases:
       other 6 FDW-backed tables are unaffected. Nothing to migrate:
       no column changes, only which rows get inserted going forward.
     migration: null
+
+  - version: "0.4.2"
+    description: >-
+      Fix: schema self-detection (0.4.0) failed whenever the schema was
+      on the search_path a routine was compiled with -- PL/pgSQL then
+      leaves the schema out of the PG_CONTEXT signature, so v_schema
+      came out NULL and SET search_path failed with "null values cannot
+      be formatted as an SQL identifier". That is what pg_cron hits
+      when the owner role's search_path includes the schema, so the
+      scheduled collect_stats() never ran. collect_stats(),
+      setup_instance_fdw(), refresh_instance_fdw() and
+      delete_collection() now resolve the context's own signature with
+      to_regprocedure(), which accepts either form. The migration
+      patches that one line in each live routine, keeping its owner.
+    migration: migrations/0004_schema_detection_search_path.sql

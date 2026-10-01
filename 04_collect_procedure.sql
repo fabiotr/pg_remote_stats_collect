@@ -112,7 +112,17 @@ DECLARE
     v_version   numeric;
 BEGIN
     GET DIAGNOSTICS v_context = PG_CONTEXT;
-    v_schema := (regexp_match(v_context, E'function ([^.]+)\\.'))[1];
+    -- First context line = this routine's own signature, schema-qualified
+    -- only when its schema isn't on the search_path it was compiled with
+    -- (e.g. pg_cron runs as a role whose search_path includes it).
+    -- to_regprocedure() resolves either form to this routine.
+    SELECT n.nspname INTO v_schema
+        FROM pg_proc AS p
+        JOIN pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE p.oid = to_regprocedure(substring(split_part(v_context, E'\n', 1) FROM E'(\\S+\\(.*\\))'));
+    IF v_schema IS NULL THEN
+        RAISE EXCEPTION 'could not detect this routine''s schema from PG_CONTEXT: %', v_context;
+    END IF;
     EXECUTE format('SET search_path = %I', v_schema);
 
     v_job_id := nextval(pg_get_serial_sequence('stat_collect_job', 'id'));
