@@ -26,7 +26,9 @@
 --
 -- None of the three procedures below hardcode the schema they live in
 -- -- each self-detects it via GET DIAGNOSTICS/PG_CONTEXT (the schema
--- it was deployed into, from -v schema= above) and does
+-- it was deployed into, from -v schema= above), resolving the context's
+-- own signature with to_regprocedure() so it works whether or not that
+-- schema is on the caller's search_path, and does
 -- SET search_path accordingly as its first step, so every reference
 -- in the rest of the body can stay unqualified. A helper called from
 -- within one of these (_build_instance_tables) just reads
@@ -215,7 +217,17 @@ DECLARE
     v_conninfo    text;
 BEGIN
     GET DIAGNOSTICS v_context = PG_CONTEXT;
-    v_schema := (regexp_match(v_context, E'function ([^.]+)\\.'))[1];
+    -- First context line = this routine's own signature, schema-qualified
+    -- only when its schema isn't on the search_path it was compiled with
+    -- (e.g. pg_cron runs as a role whose search_path includes it).
+    -- to_regprocedure() resolves either form to this routine.
+    SELECT n.nspname INTO v_schema
+        FROM pg_proc AS p
+        JOIN pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE p.oid = to_regprocedure(substring(split_part(v_context, E'\n', 1) FROM E'(\\S+\\(.*\\))'));
+    IF v_schema IS NULL THEN
+        RAISE EXCEPTION 'could not detect this routine''s schema from PG_CONTEXT: %', v_context;
+    END IF;
     EXECUTE format('SET search_path = %I', v_schema);
 
     SELECT fdw_server, host, port, database_name, remote_user
@@ -288,7 +300,17 @@ DECLARE
     v_pgss_minor int;
 BEGIN
     GET DIAGNOSTICS v_context = PG_CONTEXT;
-    v_schema := (regexp_match(v_context, E'function ([^.]+)\\.'))[1];
+    -- First context line = this routine's own signature, schema-qualified
+    -- only when its schema isn't on the search_path it was compiled with
+    -- (e.g. pg_cron runs as a role whose search_path includes it).
+    -- to_regprocedure() resolves either form to this routine.
+    SELECT n.nspname INTO v_schema
+        FROM pg_proc AS p
+        JOIN pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE p.oid = to_regprocedure(substring(split_part(v_context, E'\n', 1) FROM E'(\\S+\\(.*\\))'));
+    IF v_schema IS NULL THEN
+        RAISE EXCEPTION 'could not detect this routine''s schema from PG_CONTEXT: %', v_context;
+    END IF;
     EXECUTE format('SET search_path = %I', v_schema);
 
     SELECT fdw_server INTO v_server
