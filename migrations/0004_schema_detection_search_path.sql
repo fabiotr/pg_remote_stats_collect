@@ -29,7 +29,7 @@
 
 BEGIN;
 
-SELECT set_config('stats_collect_migration.schema', :'schema', true);
+SELECT set_config('stats_collect_migration.schema', :'schema', TRUE);
 
 DO $do$
 DECLARE
@@ -74,8 +74,8 @@ BEGIN
         IF v_match IS NULL THEN
             RAISE EXCEPTION '%.%: old schema detection line not found, nothing replaced', v_schema, v_name;
         END IF;
-        IF NOT pg_has_role(current_user, v_owner, 'USAGE') THEN
-            RAISE EXCEPTION '%.% is owned by %, which % cannot act as', v_schema, v_name, v_owner, current_user
+        IF NOT pg_has_role(CURRENT_USER, v_owner, 'USAGE') THEN
+            RAISE EXCEPTION '%.% is owned by %, which % cannot act as', v_schema, v_name, v_owner, CURRENT_USER
                 USING HINT = 'Run this migration as the routines'' owner.';
         END IF;
 
