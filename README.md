@@ -44,7 +44,7 @@ Either mode ends with a password summary — capture it into a password manager,
 
 ### Schema layout (`stats_collect`, configurable via `config.yaml`'s `schema` key)
 
-Every procedure/function below self-detects the schema it was deployed into at runtime (`GET DIAGNOSTICS`/`PG_CONTEXT`) instead of hardcoding it, so a `schema:` value other than the default works with no further changes — see [Versioning](#versioning-releasesyaml)'s 0.4.0 entry.
+Every procedure/function below self-detects the schema it was deployed into at runtime (`GET DIAGNOSTICS`/`PG_CONTEXT`, resolved with `to_regprocedure()` so it also works when that schema is on the caller's `search_path`, as under `pg_cron` with a role-level `search_path`) instead of hardcoding it, so a `schema:` value other than the default works with no further changes — see [Versioning](#versioning-releasesyaml)'s 0.4.0 entry.
 
 - `instance_name` — enum of every instance you monitor, built from `config.yaml`'s `instances[]` by `deploy.py`.
 - `schema_releases` — one row per project release: `version` (primary key, semver, matches [`releases.yaml`](releases.yaml)), `deployed_at`, `description`. See [Versioning](#versioning-releasesyaml).
