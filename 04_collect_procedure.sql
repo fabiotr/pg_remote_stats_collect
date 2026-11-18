@@ -227,32 +227,62 @@ BEGIN
         INSERT INTO hist_tables_size
         SELECT v_job_id, v_inst.instance, s.*
         FROM dblink(v_inst.fdw_server, $sql_tblsize$
+            WITH RECURSIVE partition_tree AS (
+                -- Anchor: every non-temp, visible table/materialized
+                -- view/partitioned-or-inherited parent that is not
+                -- itself a partition/child of something else.
+                SELECT c.oid, c.oid AS root_oid
+                FROM pg_class c
+                    LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r','m','p')
+                    AND c.relpersistence != 'temporary'
+                    AND n.nspname <> 'information_schema'
+                    AND n.nspname !~ '^pg_toast'
+                    AND pg_table_is_visible(c.oid)
+                    AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
+                UNION ALL
+                -- Walk down to every partition/child, tagging each with
+                -- its top-level ancestor (root_oid), however many levels
+                -- deep -- a partitioned table is sized as one table, not
+                -- one row per partition.
+                SELECT i.inhrelid, pt.root_oid
+                FROM pg_inherits i
+                    JOIN partition_tree pt ON i.inhparent = pt.oid
+            ),
+            leaves AS (
+                -- Only relkind 'r'/'m' leaves have storage of their own
+                -- -- a partitioned/inheritance parent (relkind 'p') is a
+                -- catalog-only placeholder with no physical size, so it
+                -- never contributes its own row here, only its leaves'.
+                SELECT pt.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
+                FROM partition_tree pt
+                    JOIN pg_class leaf ON leaf.oid = pt.oid
+                WHERE leaf.relkind IN ('r','m')
+            )
             SELECT
                 coalesce(t.spcname, nullif(current_setting('default_tablespace'),''), 'pg_default') AS tablespace,
                 n.nspname AS schema,
                 c.relname AS name,
-                CASE c.relkind WHEN 'r' THEN 'table' WHEN 'm' THEN 'materialized view' WHEN 'p' THEN 'partition table' END AS type,
+                CASE c.relkind WHEN 'r' THEN 'table' WHEN 'm' THEN 'materialized view' WHEN 'p' THEN 'partitioned table' END AS type,
                 CASE c.relpersistence WHEN 'p' THEN 'permanent' WHEN 'u' THEN 'unlogged' END AS persistence,
                 pg_get_userbyid(c.relowner) AS owner,
-                pg_total_relation_size(c.oid) AS total_size,
-                pg_indexes_size(c.oid) AS index_size,
-                round(100 * pg_indexes_size(c.oid) / nullif(pg_total_relation_size(c.oid),0), 2) AS index_size_pct,
-                pg_relation_size(c.oid,'main') AS heap_size,
-                round(100 * pg_relation_size(c.oid,'main') / nullif(pg_total_relation_size(c.oid),0), 2) AS heap_size_pct,
-                pg_table_size(c.reltoastrelid) AS toast_size,
-                round(100 * pg_table_size(c.reltoastrelid) / nullif(pg_total_relation_size(c.oid),0), 2) AS toast_size_pct,
-                c.reltuples AS rows,
-                trunc(pg_table_size(c.oid) / nullif(c.reltuples,0))::numeric AS avg_row_size
-            FROM pg_class c
+                sum(pg_total_relation_size(l.leaf_oid)) AS total_size,
+                sum(pg_indexes_size(l.leaf_oid)) AS index_size,
+                round(100 * sum(pg_indexes_size(l.leaf_oid)) / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS index_size_pct,
+                sum(pg_relation_size(l.leaf_oid,'main')) AS heap_size,
+                round(100 * sum(pg_relation_size(l.leaf_oid,'main')) / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS heap_size_pct,
+                sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END) AS toast_size,
+                round(100 * sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END)
+                    / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS toast_size_pct,
+                sum(l.reltuples) AS rows,
+                trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric AS avg_row_size
+            FROM leaves l
+                JOIN pg_class c ON c.oid = l.root_oid
                 LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
                 LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r','m','')
-                AND c.relpersistence != 'temporary'
-                AND n.nspname <> 'information_schema'
-                AND n.nspname !~ '^pg_toast'
-                AND pg_table_is_visible(c.oid)
-            ORDER BY pg_total_relation_size(c.oid) DESC
-            LIMIT 10
+            GROUP BY c.oid, t.spcname, n.nspname, c.relname, c.relkind, c.relpersistence, c.relowner
+            ORDER BY sum(pg_total_relation_size(l.leaf_oid)) DESC
+            LIMIT 20
         $sql_tblsize$) AS s(
             tablespace text, schema name, name name, type text, persistence text,
             owner name, total_size bigint, index_size bigint, index_size_pct numeric,
