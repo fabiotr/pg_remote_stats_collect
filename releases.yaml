@@ -140,5 +140,9 @@ releases:
       migrate on hist_tables_size itself: no column changes, only which
       rows (and how total_size etc. are computed) going forward --
       existing history stays as collected, still a valid partial view
-      of the partitioned tables it captured before this release.
+      of the partitioned tables it captured before this release. Ranks
+      roots by total_size in its own step and limits to 20 before
+      computing the index/heap/toast/row breakdown, instead of paying
+      for that breakdown on every eligible table or partition and
+      discarding most of it.
     migration: migrations/0005_partitioned_tables_as_one.sql
