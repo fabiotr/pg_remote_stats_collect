@@ -262,6 +262,24 @@ BEGIN
                 FROM partition_tree pt
                     JOIN pg_class leaf ON leaf.oid = pt.oid
                 WHERE leaf.relkind IN ('r','m')
+            ),
+            top_roots AS (
+                -- Rank by total_size and keep only the top 20 *before*
+                -- computing index/heap/toast/row breakdowns below --
+                -- pg_indexes_size()/pg_relation_size()/pg_table_size()
+                -- each cost a stat() per leaf, so a heavily-partitioned
+                -- table that doesn't make the cut shouldn't pay for
+                -- them. Every supported PostgreSQL version materializes
+                -- this CTE as written: pre-12 always did (no inlining
+                -- existed yet), and this one is referenced only once,
+                -- which keeps 12+ from having a reason to inline it
+                -- either -- so avoid the MATERIALIZED keyword (12+
+                -- only) rather than lean on that.
+                SELECT root_oid, sum(pg_total_relation_size(leaf_oid)) AS total_size
+                FROM leaves
+                GROUP BY root_oid
+                ORDER BY total_size DESC
+                LIMIT 20
             )
             SELECT
                 coalesce(t.spcname, nullif(current_setting('default_tablespace'),''), 'pg_default') AS tablespace,
@@ -270,14 +288,14 @@ BEGIN
                 CASE c.relkind WHEN 'r' THEN 'table' WHEN 'm' THEN 'materialized view' WHEN 'p' THEN 'partitioned table' END AS type,
                 CASE c.relpersistence WHEN 'p' THEN 'permanent' WHEN 'u' THEN 'unlogged' END AS persistence,
                 pg_get_userbyid(c.relowner) AS owner,
-                sum(pg_total_relation_size(l.leaf_oid)) AS total_size,
+                tr.total_size,
                 sum(pg_indexes_size(l.leaf_oid)) AS index_size,
-                round(100 * sum(pg_indexes_size(l.leaf_oid)) / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS index_size_pct,
+                round(100 * sum(pg_indexes_size(l.leaf_oid)) / nullif(tr.total_size,0), 2) AS index_size_pct,
                 sum(pg_relation_size(l.leaf_oid,'main')) AS heap_size,
-                round(100 * sum(pg_relation_size(l.leaf_oid,'main')) / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS heap_size_pct,
+                round(100 * sum(pg_relation_size(l.leaf_oid,'main')) / nullif(tr.total_size,0), 2) AS heap_size_pct,
                 sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END) AS toast_size,
                 round(100 * sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END)
-                    / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS toast_size_pct,
+                    / nullif(tr.total_size,0), 2) AS toast_size_pct,
                 -- reltuples = -1 means "never vacuumed/analyzed", not
                 -- zero rows -- summing it in would silently understate
                 -- the total instead of just leaving it unknown, so any
@@ -286,12 +304,13 @@ BEGIN
                 CASE WHEN bool_or(l.reltuples < 0) THEN NULL
                     ELSE trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric
                 END AS avg_row_size
-            FROM leaves l
-                JOIN pg_class c ON c.oid = l.root_oid
+            FROM top_roots tr
+                JOIN leaves l ON l.root_oid = tr.root_oid
+                JOIN pg_class c ON c.oid = tr.root_oid
                 LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
                 LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-            GROUP BY c.oid, t.spcname, n.nspname, c.relname, c.relkind, c.relpersistence, c.relowner
-            ORDER BY sum(pg_total_relation_size(l.leaf_oid)) DESC
+            GROUP BY tr.root_oid, tr.total_size, t.spcname, n.nspname, c.relname, c.relkind, c.relpersistence, c.relowner
+            ORDER BY tr.total_size DESC
             LIMIT 20
         $sql_tblsize$) AS s(
             tablespace text, schema name, name name, type text, persistence text,
