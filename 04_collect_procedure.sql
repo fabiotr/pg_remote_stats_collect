@@ -240,11 +240,15 @@ BEGIN
                     AND n.nspname !~ '^pg_toast'
                     AND pg_table_is_visible(c.oid)
                     AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
-                UNION ALL
+                UNION
                 -- Walk down to every partition/child, tagging each with
                 -- its top-level ancestor (root_oid), however many levels
                 -- deep -- a partitioned table is sized as one table, not
-                -- one row per partition.
+                -- one row per partition. Plain UNION (not ALL): classic
+                -- multiple inheritance (not partitioning, which is
+                -- single-parent) can reach the same descendant via more
+                -- than one parent path, so dedupe (oid, root_oid) pairs
+                -- to avoid double-counting that descendant's size.
                 SELECT i.inhrelid, pt.root_oid
                 FROM pg_inherits i
                     JOIN partition_tree pt ON i.inhparent = pt.oid
@@ -274,8 +278,14 @@ BEGIN
                 sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END) AS toast_size,
                 round(100 * sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END)
                     / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS toast_size_pct,
-                sum(l.reltuples) AS rows,
-                trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric AS avg_row_size
+                -- reltuples = -1 means "never vacuumed/analyzed", not
+                -- zero rows -- summing it in would silently understate
+                -- the total instead of just leaving it unknown, so any
+                -- unanalyzed leaf makes both of these NULL instead.
+                CASE WHEN bool_or(l.reltuples < 0) THEN NULL ELSE sum(l.reltuples) END AS rows,
+                CASE WHEN bool_or(l.reltuples < 0) THEN NULL
+                    ELSE trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric
+                END AS avg_row_size
             FROM leaves l
                 JOIN pg_class c ON c.oid = l.root_oid
                 LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace

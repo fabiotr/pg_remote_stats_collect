@@ -24,9 +24,57 @@
 -- change, only which rows get inserted going forward (existing history
 -- stays as collected, still a valid partial view of the partitioned
 -- tables it captured before this release).
+--
+-- Also (re)installs copy_top_statements(), first added in 0.4.1 --
+-- that release's own migration is null, so an environment that reached
+-- 0.4.1 purely through `--migrate` (never had 04_collect_procedure.sql
+-- run against it directly) never actually got this helper, even though
+-- collect_stats() has called it since. Without it, every instance's
+-- collection in this procedure fails and rolls back. CREATE OR REPLACE
+-- is a no-op if it's already there and keeps its owner in that case; on
+-- an environment where it's genuinely missing, it's created owned by
+-- whoever runs this migration -- same as any other first-time
+-- migration-created object.
 -- =====================================================================
 
 BEGIN;
+
+CREATE OR REPLACE FUNCTION :"schema".copy_top_statements(
+    p_source_table text,
+    p_job_id bigint,
+    p_instance :"schema".instance_name,
+    p_limit int DEFAULT 100
+) RETURNS void
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    v_schema    name := current_schema();
+    v_cols      text;
+    v_order_by  text;
+    v_has_split boolean;
+BEGIN
+    SELECT bool_or(column_name = 'total_plan_time') INTO v_has_split
+    FROM information_schema.columns
+    WHERE table_schema = v_schema AND table_name = p_source_table;
+    v_order_by := CASE WHEN v_has_split THEN 'total_plan_time + total_exec_time' ELSE 'total_time' END;
+
+    SELECT string_agg(
+        CASE WHEN fc.column_name IS NOT NULL THEN quote_ident(tc.column_name)
+             ELSE format('NULL::%s', tc.data_type)
+        END, ', ' ORDER BY tc.ordinal_position)
+    INTO v_cols
+    FROM information_schema.columns tc
+    LEFT JOIN information_schema.columns fc
+        ON fc.table_schema = v_schema AND fc.table_name = p_source_table
+            AND fc.column_name = tc.column_name
+    WHERE tc.table_schema = v_schema AND tc.table_name = 'hist_pg_stat_statements'
+        AND tc.column_name NOT IN ('id_stat_collect_job', 'instance');
+
+    EXECUTE format(
+        'INSERT INTO hist_pg_stat_statements SELECT %L::bigint, %L::%I.instance_name, %s FROM %I ORDER BY %s DESC NULLS LAST LIMIT %s',
+        p_job_id, p_instance::text, v_schema, v_cols, p_source_table, v_order_by, p_limit);
+END;
+$func$;
 
 CREATE OR REPLACE PROCEDURE :"schema".collect_stats()
 LANGUAGE plpgsql
@@ -168,11 +216,15 @@ BEGIN
                     AND n.nspname !~ '^pg_toast'
                     AND pg_table_is_visible(c.oid)
                     AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
-                UNION ALL
+                UNION
                 -- Walk down to every partition/child, tagging each with
                 -- its top-level ancestor (root_oid), however many levels
                 -- deep -- a partitioned table is sized as one table, not
-                -- one row per partition.
+                -- one row per partition. Plain UNION (not ALL): classic
+                -- multiple inheritance (not partitioning, which is
+                -- single-parent) can reach the same descendant via more
+                -- than one parent path, so dedupe (oid, root_oid) pairs
+                -- to avoid double-counting that descendant's size.
                 SELECT i.inhrelid, pt.root_oid
                 FROM pg_inherits i
                     JOIN partition_tree pt ON i.inhparent = pt.oid
@@ -202,8 +254,14 @@ BEGIN
                 sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END) AS toast_size,
                 round(100 * sum(CASE WHEN l.reltoastrelid <> 0 THEN pg_table_size(l.reltoastrelid) ELSE 0 END)
                     / nullif(sum(pg_total_relation_size(l.leaf_oid)),0), 2) AS toast_size_pct,
-                sum(l.reltuples) AS rows,
-                trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric AS avg_row_size
+                -- reltuples = -1 means "never vacuumed/analyzed", not
+                -- zero rows -- summing it in would silently understate
+                -- the total instead of just leaving it unknown, so any
+                -- unanalyzed leaf makes both of these NULL instead.
+                CASE WHEN bool_or(l.reltuples < 0) THEN NULL ELSE sum(l.reltuples) END AS rows,
+                CASE WHEN bool_or(l.reltuples < 0) THEN NULL
+                    ELSE trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric
+                END AS avg_row_size
             FROM leaves l
                 JOIN pg_class c ON c.oid = l.root_oid
                 LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
