@@ -112,3 +112,37 @@ releases:
       to_regprocedure(), which accepts either form. The migration
       patches that one line in each live routine, keeping its owner.
     migration: migrations/0004_schema_detection_search_path.sql
+
+  - version: "0.4.3"
+    description: >-
+      hist_tables_size collection now rolls up every partition (any
+      depth, via pg_inherits) to its top-level ancestor and sizes a
+      partitioned table as one table, instead of individually capturing
+      whichever of its partitions happened to rank among the instance's
+      top tables by size -- a large partitioned table (e.g. one with
+      dozens of monthly partitions) was massively under-represented
+      before this. The per-instance row limit also goes from 10 to 20;
+      rpt_tables_size_history_raw (06_reports.sql) already ranks
+      "rn <= 20", so this makes that pre-existing limit meaningful
+      instead of a no-op against a 10-row source. Dedupes the rollup
+      with UNION (not UNION ALL): classic multiple inheritance (not
+      partitioning, which is single-parent) can reach a descendant via
+      more than one parent path, which would otherwise double-count it.
+      rows/avg_row_size come out NULL instead of a silently-understated
+      number when any contributing partition has reltuples = -1
+      (never vacuumed/analyzed). The migration also (re)installs
+      copy_top_statements() (0.4.1): that release's own migration is
+      null, so an environment that reached 0.4.1 purely through
+      `--migrate` never actually got it, even though collect_stats()
+      has called it since -- without it, this release's migration would
+      replace collect_stats() with a body that calls a function that
+      doesn't exist, failing every instance's collection. Nothing to
+      migrate on hist_tables_size itself: no column changes, only which
+      rows (and how total_size etc. are computed) going forward --
+      existing history stays as collected, still a valid partial view
+      of the partitioned tables it captured before this release. Ranks
+      roots by total_size in its own step and limits to 20 before
+      computing the index/heap/toast/row breakdown, instead of paying
+      for that breakdown on every eligible table or partition and
+      discarding most of it.
+    migration: migrations/0005_partitioned_tables_as_one.sql
