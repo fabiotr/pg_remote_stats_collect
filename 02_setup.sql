@@ -347,7 +347,8 @@ CREATE TABLE hist_object_size (
 );
 CREATE INDEX ON hist_object_size (instance, id_stat_collect_job);
 
--- tables_size_95up.sql (top 10 largest tables)
+-- tables_size_95up.sql (top 20 largest tables, partitioned/inherited
+-- ones rolled up to one row -- see 04_collect_procedure.sql)
 CREATE TABLE hist_tables_size (
     id_stat_collect_job bigint NOT NULL,
     instance             instance_name NOT NULL,
@@ -366,6 +367,13 @@ CREATE TABLE hist_tables_size (
     toast_size_pct       numeric,
     rows                 real,
     avg_row_size         numeric,
+    -- Always true going forward (every row is a rollup now, even a
+    -- trivial one-leaf table); false only for rows collected before
+    -- 0.4.3's partition/inheritance rollup existed, so growth
+    -- calculations (06_reports.sql) can tell the two methodologies
+    -- apart instead of reading the one-time jump between them as
+    -- real growth.
+    is_rollup            boolean NOT NULL DEFAULT true,
     FOREIGN KEY (id_stat_collect_job, instance) REFERENCES stat_collect_job (id, instance)
 );
 CREATE INDEX ON hist_tables_size (instance, id_stat_collect_job);

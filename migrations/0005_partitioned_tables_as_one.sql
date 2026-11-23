@@ -35,9 +35,39 @@
 -- an environment where it's genuinely missing, it's created owned by
 -- whoever runs this migration -- same as any other first-time
 -- migration-created object.
+--
+-- UPDATE (folded in before this release ever shipped to a real
+-- environment -- see releases.yaml's 0.4.4 entry): the rollup CTE
+-- below originally required visibility (pg_table_is_visible()) on the
+-- top-level ancestor itself, walking DOWN from there via pg_inherits.
+-- Whenever that one ancestor wasn't visible on the connection's
+-- search_path (its own schema not on it, or its name shadowed by
+-- another schema earlier on it) -- even though its partitions/children
+-- were -- the whole subtree silently disappeared from hist_tables_size,
+-- not just the obscured ancestor. It now anchors on each visible,
+-- storage-bearing LEAF instead and walks UP via pg_inherits to find
+-- that leaf's top-level ancestor regardless of the ancestor's own
+-- visibility, since an ancestor's visibility was never what made a
+-- leaf's bytes real.
+--
+-- hist_tables_size also gains an is_rollup column (always true going
+-- forward): 0.4.3 changes what total_size *means* for any table that
+-- turns out to be a rollup root -- from "this one relation" to "the
+-- whole subtree" -- under the same (instance, schema, name) key a
+-- prior release may already have a row for. Without a way to tell the
+-- two methodologies apart, rpt_tables_size_history_raw's month/year
+-- growth columns (06_reports.sql) would read that one-time jump as
+-- real growth. Existing rows are backfilled to false so the growth
+-- window (partitioned by is_rollup, among other things) starts a new,
+-- unconnected series at the first rollup-scoped row instead.
 -- =====================================================================
 
 BEGIN;
+
+ALTER TABLE :"schema".hist_tables_size ADD COLUMN IF NOT EXISTS is_rollup boolean;
+UPDATE :"schema".hist_tables_size SET is_rollup = false WHERE is_rollup IS NULL;
+ALTER TABLE :"schema".hist_tables_size ALTER COLUMN is_rollup SET NOT NULL;
+ALTER TABLE :"schema".hist_tables_size ALTER COLUMN is_rollup SET DEFAULT true;
 
 CREATE OR REPLACE FUNCTION :"schema".copy_top_statements(
     p_source_table text,
@@ -203,41 +233,56 @@ BEGIN
         INSERT INTO hist_tables_size
         SELECT v_job_id, v_inst.instance, s.*
         FROM dblink(v_inst.fdw_server, $sql_tblsize$
-            WITH RECURSIVE partition_tree AS (
+            WITH RECURSIVE ancestry AS (
                 -- Anchor: every non-temp, visible table/materialized
-                -- view/partitioned-or-inherited parent that is not
-                -- itself a partition/child of something else.
-                SELECT c.oid, c.oid AS root_oid
+                -- view that actually has storage of its own.
+                -- Visibility is checked HERE, at the storage-bearing
+                -- leaf, not at some ancestor further up the tree: a
+                -- partitioned/inheritance parent (relkind 'p', or an
+                -- ordinary 'r' used as a classic-inheritance parent)
+                -- might not itself be visible -- its own schema isn't
+                -- on search_path, or its name is shadowed by another
+                -- schema earlier on it -- even though its children
+                -- are, and such a child's bytes still belong on the
+                -- report. Requiring visibility at some ancestor
+                -- instead would make the entire subtree disappear
+                -- whenever that one ancestor isn't visible, not just
+                -- the obscured ancestor.
+                SELECT c.oid AS leaf_oid, c.oid AS ancestor_oid
                 FROM pg_class c
                     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r','m','p')
+                WHERE c.relkind IN ('r','m')
                     AND c.relpersistence != 'temporary'
                     AND n.nspname <> 'information_schema'
                     AND n.nspname !~ '^pg_toast'
                     AND pg_table_is_visible(c.oid)
-                    AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
                 UNION
-                -- Walk down to every partition/child, tagging each with
-                -- its top-level ancestor (root_oid), however many levels
-                -- deep -- a partitioned table is sized as one table, not
-                -- one row per partition. Plain UNION (not ALL): classic
-                -- multiple inheritance (not partitioning, which is
-                -- single-parent) can reach the same descendant via more
-                -- than one parent path, so dedupe (oid, root_oid) pairs
-                -- to avoid double-counting that descendant's size.
-                SELECT i.inhrelid, pt.root_oid
+                -- Walk UP the inheritance chain (any depth) from each
+                -- visible leaf toward its top-level ancestor, whatever
+                -- that ancestor's own visibility happens to be. Plain
+                -- UNION (not ALL): classic multiple inheritance (not
+                -- partitioning, which is single-parent) can put more
+                -- than one parent above the same leaf, which would
+                -- otherwise walk the same (leaf_oid, ancestor_oid)
+                -- pair more than once.
+                SELECT a.leaf_oid, i.inhparent
                 FROM pg_inherits i
-                    JOIN partition_tree pt ON i.inhparent = pt.oid
+                    JOIN ancestry a ON i.inhrelid = a.ancestor_oid
+            ),
+            roots AS (
+                -- Each leaf's true top-level ancestor is the one row
+                -- where ancestor_oid has no parent of its own -- a
+                -- leaf N inheritance levels deep produces N+1 ancestry
+                -- rows (itself, then each ancestor up the chain), and
+                -- only the topmost is never itself someone's child.
+                SELECT leaf_oid, ancestor_oid AS root_oid
+                FROM ancestry a
+                WHERE NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = a.ancestor_oid)
             ),
             leaves AS (
-                -- Only relkind 'r'/'m' leaves have storage of their own
-                -- -- a partitioned/inheritance parent (relkind 'p') is a
-                -- catalog-only placeholder with no physical size, so it
-                -- never contributes its own row here, only its leaves'.
-                SELECT pt.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
-                FROM partition_tree pt
-                    JOIN pg_class leaf ON leaf.oid = pt.oid
-                WHERE leaf.relkind IN ('r','m')
+                SELECT r.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
+                FROM roots r
+                    JOIN pg_class leaf ON leaf.oid = r.leaf_oid
             ),
             top_roots AS (
                 -- Rank by total_size and keep only the top 20 *before*
@@ -279,7 +324,8 @@ BEGIN
                 CASE WHEN bool_or(l.reltuples < 0) THEN NULL ELSE sum(l.reltuples) END AS rows,
                 CASE WHEN bool_or(l.reltuples < 0) THEN NULL
                     ELSE trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric
-                END AS avg_row_size
+                END AS avg_row_size,
+                true AS is_rollup
             FROM top_roots tr
                 JOIN leaves l ON l.root_oid = tr.root_oid
                 JOIN pg_class c ON c.oid = tr.root_oid
@@ -292,7 +338,7 @@ BEGIN
             tablespace text, schema name, name name, type text, persistence text,
             owner name, total_size bigint, index_size bigint, index_size_pct numeric,
             heap_size bigint, heap_size_pct numeric, toast_size bigint,
-            toast_size_pct numeric, rows real, avg_row_size numeric
+            toast_size_pct numeric, rows real, avg_row_size numeric, is_rollup boolean
         );
 
         INSERT INTO hist_index_poor
@@ -386,5 +432,147 @@ BEGIN
         (SELECT count(*) FROM stat_collect_job WHERE id = v_job_id AND status = 'failed');
 END;
 $proc$;
+
+-- --------------------------------------------------------------------
+-- 06_reports.sql's rpt_tables_size_history_raw/rpt_tables_size_history
+-- aren't re-run by `./deploy.py --migrate` (only this file is), so the
+-- is_rollup-aware growth window has to be applied here too for an
+-- already-deployed environment to actually get it -- a fresh deploy
+-- gets it straight from 06_reports.sql instead. CREATE OR REPLACE VIEW
+-- can't reorder or drop existing output columns, only append new ones,
+-- which is why is_rollup is added at the very end of both views'
+-- column lists instead of next to total_size where it reads better --
+-- 06_reports.sql matches that same order so the two never drift apart.
+-- --------------------------------------------------------------------
+SET search_path = :"schema";
+
+CREATE OR REPLACE VIEW rpt_tables_size_history_raw AS
+WITH latest_job AS (
+    SELECT h.instance, max(h.id_stat_collect_job) AS id_stat_collect_job
+    FROM hist_tables_size h
+        JOIN instance_config ic ON ic.instance = h.instance
+    WHERE ic.cluster = ic.instance
+    GROUP BY h.instance
+),
+top_tables AS (
+    SELECT instance, schema, name
+    FROM (
+        SELECT
+            h.instance,
+            h.schema,
+            h.name,
+            row_number() OVER (PARTITION BY h.instance ORDER BY h.total_size DESC) AS rn
+        FROM hist_tables_size h
+            JOIN latest_job lj
+                ON lj.instance = h.instance AND lj.id_stat_collect_job = h.id_stat_collect_job
+    ) ranked
+    WHERE rn <= 20
+),
+history AS (
+    SELECT
+        j.collect_start::date AS collect_date,
+        h.instance,
+        h.tablespace,
+        h.schema,
+        h.name,
+        h.type,
+        h.persistence,
+        h.owner,
+        h.total_size,
+        h.index_size,
+        h.index_size_pct,
+        h.heap_size,
+        h.heap_size_pct,
+        h.toast_size,
+        h.toast_size_pct,
+        h.rows,
+        h.avg_row_size,
+        h.is_rollup
+    FROM hist_tables_size h
+        JOIN stat_collect_job j ON j.id = h.id_stat_collect_job AND j.instance = h.instance
+        JOIN top_tables t ON t.instance = h.instance AND t.schema = h.schema AND t.name = h.name
+),
+with_growth AS (
+    -- is_rollup is part of the partition key, not just a passthrough
+    -- column: 0.4.3 made total_size mean "whole partition/inheritance
+    -- subtree" instead of "this one relation", for any table that
+    -- turns out to be a rollup root -- under the same (instance,
+    -- schema, name), so the first rollup-scoped row would otherwise
+    -- show a one-time jump that lag()/first_value() would read as
+    -- real growth. Splitting the window by is_rollup makes that first
+    -- row start a new series (prev/first values NULL) instead.
+    SELECT
+        history.*,
+        lag(total_size) OVER w_seq             AS prev_total_size,
+        lag(collect_date) OVER w_seq           AS prev_collect_date,
+        first_value(total_size) OVER w_full    AS first_total_size,
+        first_value(collect_date) OVER w_full  AS first_collect_date,
+        last_value(total_size) OVER w_full     AS last_total_size,
+        last_value(collect_date) OVER w_full   AS last_collect_date
+    FROM history
+    WINDOW
+        w_seq AS (PARTITION BY instance, schema, name, is_rollup ORDER BY collect_date),
+        w_full AS (PARTITION BY instance, schema, name, is_rollup ORDER BY collect_date
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+)
+SELECT
+    collect_date,
+    instance,
+    tablespace,
+    schema,
+    name,
+    type,
+    persistence,
+    owner,
+    total_size,
+    index_size,
+    index_size_pct,
+    heap_size,
+    heap_size_pct,
+    toast_size,
+    toast_size_pct,
+    rows,
+    avg_row_size,
+    (total_size - prev_total_size)
+        / nullif(collect_date - prev_collect_date, 0) * 30 AS month_growth_bytes,
+    round(
+        (total_size - prev_total_size) * 100.0 / nullif(prev_total_size, 0)
+            / nullif(collect_date - prev_collect_date, 0) * 30
+    , 2) AS month_growth_pct,
+    (last_total_size - first_total_size)
+        / nullif(last_collect_date - first_collect_date, 0) * 365 AS year_growth_bytes,
+    round(
+        (last_total_size - first_total_size) * 100.0 / nullif(first_total_size, 0)
+            / nullif(last_collect_date - first_collect_date, 0) * 365
+    , 2) AS year_growth_pct,
+    is_rollup
+FROM with_growth
+ORDER BY collect_date DESC, instance, total_size DESC;
+
+CREATE OR REPLACE VIEW rpt_tables_size_history AS
+SELECT
+    collect_date,
+    instance,
+    tablespace,
+    schema,
+    name,
+    type,
+    persistence,
+    owner,
+    lpad(pg_size_pretty(round(total_size)::bigint), 7) AS total_size,
+    lpad(pg_size_pretty(round(index_size)::bigint), 7) AS index_size,
+    index_size_pct,
+    lpad(pg_size_pretty(round(heap_size)::bigint), 7) AS heap_size,
+    heap_size_pct,
+    lpad(pg_size_pretty(round(toast_size)::bigint), 7) AS toast_size,
+    toast_size_pct,
+    lpad(to_char(rows, 'FM999G999G999G999G999'), 15) AS rows,
+    avg_row_size,
+    lpad(pg_size_pretty(round(month_growth_bytes)::bigint), 8) AS month_growth_bytes,
+    month_growth_pct,
+    lpad(pg_size_pretty(round(year_growth_bytes)::bigint), 8) AS year_growth_bytes,
+    year_growth_pct,
+    is_rollup
+FROM rpt_tables_size_history_raw;
 
 COMMIT;

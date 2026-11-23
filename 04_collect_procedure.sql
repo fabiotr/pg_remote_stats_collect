@@ -227,41 +227,56 @@ BEGIN
         INSERT INTO hist_tables_size
         SELECT v_job_id, v_inst.instance, s.*
         FROM dblink(v_inst.fdw_server, $sql_tblsize$
-            WITH RECURSIVE partition_tree AS (
+            WITH RECURSIVE ancestry AS (
                 -- Anchor: every non-temp, visible table/materialized
-                -- view/partitioned-or-inherited parent that is not
-                -- itself a partition/child of something else.
-                SELECT c.oid, c.oid AS root_oid
+                -- view that actually has storage of its own.
+                -- Visibility is checked HERE, at the storage-bearing
+                -- leaf, not at some ancestor further up the tree: a
+                -- partitioned/inheritance parent (relkind 'p', or an
+                -- ordinary 'r' used as a classic-inheritance parent)
+                -- might not itself be visible -- its own schema isn't
+                -- on search_path, or its name is shadowed by another
+                -- schema earlier on it -- even though its children
+                -- are, and such a child's bytes still belong on the
+                -- report. Requiring visibility at some ancestor
+                -- instead would make the entire subtree disappear
+                -- whenever that one ancestor isn't visible, not just
+                -- the obscured ancestor.
+                SELECT c.oid AS leaf_oid, c.oid AS ancestor_oid
                 FROM pg_class c
                     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r','m','p')
+                WHERE c.relkind IN ('r','m')
                     AND c.relpersistence != 'temporary'
                     AND n.nspname <> 'information_schema'
                     AND n.nspname !~ '^pg_toast'
                     AND pg_table_is_visible(c.oid)
-                    AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
                 UNION
-                -- Walk down to every partition/child, tagging each with
-                -- its top-level ancestor (root_oid), however many levels
-                -- deep -- a partitioned table is sized as one table, not
-                -- one row per partition. Plain UNION (not ALL): classic
-                -- multiple inheritance (not partitioning, which is
-                -- single-parent) can reach the same descendant via more
-                -- than one parent path, so dedupe (oid, root_oid) pairs
-                -- to avoid double-counting that descendant's size.
-                SELECT i.inhrelid, pt.root_oid
+                -- Walk UP the inheritance chain (any depth) from each
+                -- visible leaf toward its top-level ancestor, whatever
+                -- that ancestor's own visibility happens to be. Plain
+                -- UNION (not ALL): classic multiple inheritance (not
+                -- partitioning, which is single-parent) can put more
+                -- than one parent above the same leaf, which would
+                -- otherwise walk the same (leaf_oid, ancestor_oid)
+                -- pair more than once.
+                SELECT a.leaf_oid, i.inhparent
                 FROM pg_inherits i
-                    JOIN partition_tree pt ON i.inhparent = pt.oid
+                    JOIN ancestry a ON i.inhrelid = a.ancestor_oid
+            ),
+            roots AS (
+                -- Each leaf's true top-level ancestor is the one row
+                -- where ancestor_oid has no parent of its own -- a
+                -- leaf N inheritance levels deep produces N+1 ancestry
+                -- rows (itself, then each ancestor up the chain), and
+                -- only the topmost is never itself someone's child.
+                SELECT leaf_oid, ancestor_oid AS root_oid
+                FROM ancestry a
+                WHERE NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = a.ancestor_oid)
             ),
             leaves AS (
-                -- Only relkind 'r'/'m' leaves have storage of their own
-                -- -- a partitioned/inheritance parent (relkind 'p') is a
-                -- catalog-only placeholder with no physical size, so it
-                -- never contributes its own row here, only its leaves'.
-                SELECT pt.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
-                FROM partition_tree pt
-                    JOIN pg_class leaf ON leaf.oid = pt.oid
-                WHERE leaf.relkind IN ('r','m')
+                SELECT r.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
+                FROM roots r
+                    JOIN pg_class leaf ON leaf.oid = r.leaf_oid
             ),
             top_roots AS (
                 -- Rank by total_size and keep only the top 20 *before*
@@ -303,7 +318,8 @@ BEGIN
                 CASE WHEN bool_or(l.reltuples < 0) THEN NULL ELSE sum(l.reltuples) END AS rows,
                 CASE WHEN bool_or(l.reltuples < 0) THEN NULL
                     ELSE trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric
-                END AS avg_row_size
+                END AS avg_row_size,
+                true AS is_rollup
             FROM top_roots tr
                 JOIN leaves l ON l.root_oid = tr.root_oid
                 JOIN pg_class c ON c.oid = tr.root_oid
@@ -316,7 +332,7 @@ BEGIN
             tablespace text, schema name, name name, type text, persistence text,
             owner name, total_size bigint, index_size bigint, index_size_pct numeric,
             heap_size bigint, heap_size_pct numeric, toast_size bigint,
-            toast_size_pct numeric, rows real, avg_row_size numeric
+            toast_size_pct numeric, rows real, avg_row_size numeric, is_rollup boolean
         );
 
         INSERT INTO hist_index_poor

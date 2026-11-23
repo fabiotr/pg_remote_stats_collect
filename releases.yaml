@@ -146,3 +146,29 @@ releases:
       for that breakdown on every eligible table or partition and
       discarding most of it.
     migration: migrations/0005_partitioned_tables_as_one.sql
+
+  - version: "0.4.4"
+    description: >-
+      Fix: 0.4.3's rollup required visibility (pg_table_is_visible())
+      on the top-level ancestor itself, walking down from there via
+      pg_inherits -- whenever that one ancestor wasn't visible on the
+      connection's search_path (its own schema not on it, or its name
+      shadowed by another schema earlier on it), even though its
+      partitions/children were, the whole subtree silently disappeared
+      from hist_tables_size instead of just the obscured ancestor. It
+      now anchors on each visible, storage-bearing leaf and walks up
+      via pg_inherits to that leaf's top-level ancestor instead,
+      whatever that ancestor's own visibility happens to be. Also adds
+      hist_tables_size.is_rollup (always true going forward, backfilled
+      to false on existing rows): 0.4.3 changes what total_size *means*
+      for any table that turns out to be a rollup root -- from "this
+      one relation" to "the whole subtree" -- under the same (instance,
+      schema, name) a prior release may already have a row for, which
+      rpt_tables_size_history_raw's month/year growth columns
+      (06_reports.sql) would otherwise read as real growth. The growth
+      window is now partitioned by is_rollup too, so that one-time
+      jump starts a new, unconnected series instead. Both fixes are
+      folded directly into 0.4.3's own migration (0005) and into
+      02/04/06, since 0.4.3 never shipped to a real environment before
+      this was caught -- nothing here to run on its own.
+    migration: null
