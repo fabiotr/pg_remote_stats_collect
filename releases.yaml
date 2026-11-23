@@ -166,7 +166,13 @@ releases:
       walks down from each in-scope root with no visibility check at
       all, since an individual partition's own schema visibility was
       never what made its bytes part of the application's data, only
-      the tree's eligibility as a whole was. Also adds
+      the tree's eligibility as a whole was. That walk-up only started
+      from a storage-bearing leaf ('r'/'m'), missing the case where the
+      ONLY visible member of a multi-level tree is an intermediate
+      partitioned table ('p') with its own parent and every leaf under
+      it both invisible -- it now walks up from any visible table/
+      matview/partitioned-or-inherited parent, not just ones with
+      storage of their own. Also adds
       hist_tables_size.is_rollup (always true going forward, backfilled
       to false on existing rows): 0.4.3 changes what total_size *means*
       for any table that turns out to be a rollup root -- from "this
