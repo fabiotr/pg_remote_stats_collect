@@ -155,10 +155,18 @@ releases:
       connection's search_path (its own schema not on it, or its name
       shadowed by another schema earlier on it), even though its
       partitions/children were, the whole subtree silently disappeared
-      from hist_tables_size instead of just the obscured ancestor. It
-      now anchors on each visible, storage-bearing leaf and walks up
-      via pg_inherits to that leaf's top-level ancestor instead,
-      whatever that ancestor's own visibility happens to be. Also adds
+      from hist_tables_size instead of just the obscured ancestor. The
+      first fix for this (anchoring purely on visible leaves, walking
+      up) swapped it for its mirror image -- a visible root whose
+      individual partitions happened to live in an invisible schema
+      had those partitions silently excluded from its total, or
+      disappeared entirely if every partition was like that. The
+      rollup now determines which roots are in scope from visibility
+      ANYWHERE in the tree (the root itself, or any single leaf), then
+      walks down from each in-scope root with no visibility check at
+      all, since an individual partition's own schema visibility was
+      never what made its bytes part of the application's data, only
+      the tree's eligibility as a whole was. Also adds
       hist_tables_size.is_rollup (always true going forward, backfilled
       to false on existing rows): 0.4.3 changes what total_size *means*
       for any table that turns out to be a rollup root -- from "this

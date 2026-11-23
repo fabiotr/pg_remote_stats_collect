@@ -228,20 +228,19 @@ BEGIN
         SELECT v_job_id, v_inst.instance, s.*
         FROM dblink(v_inst.fdw_server, $sql_tblsize$
             WITH RECURSIVE ancestry AS (
-                -- Anchor: every non-temp, visible table/materialized
-                -- view that actually has storage of its own.
-                -- Visibility is checked HERE, at the storage-bearing
-                -- leaf, not at some ancestor further up the tree: a
-                -- partitioned/inheritance parent (relkind 'p', or an
-                -- ordinary 'r' used as a classic-inheritance parent)
-                -- might not itself be visible -- its own schema isn't
-                -- on search_path, or its name is shadowed by another
-                -- schema earlier on it -- even though its children
-                -- are, and such a child's bytes still belong on the
-                -- report. Requiring visibility at some ancestor
-                -- instead would make the entire subtree disappear
-                -- whenever that one ancestor isn't visible, not just
-                -- the obscured ancestor.
+                -- Walk UP the inheritance chain (any depth) from every
+                -- non-temp, visible, storage-bearing leaf toward its
+                -- top-level ancestor, whatever that ancestor's own
+                -- visibility happens to be -- this alone would find a
+                -- tree whose root isn't itself visible even though
+                -- (at least) one leaf is, but by itself still misses a
+                -- visible root none of whose OTHER leaves happen to be
+                -- visible (see eligible_roots below for that half).
+                -- Plain UNION (not ALL): classic multiple inheritance
+                -- (not partitioning, which is single-parent) can put
+                -- more than one parent above the same leaf, which
+                -- would otherwise walk the same (leaf_oid,
+                -- ancestor_oid) pair more than once.
                 SELECT c.oid AS leaf_oid, c.oid AS ancestor_oid
                 FROM pg_class c
                     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -251,32 +250,63 @@ BEGIN
                     AND n.nspname !~ '^pg_toast'
                     AND pg_table_is_visible(c.oid)
                 UNION
-                -- Walk UP the inheritance chain (any depth) from each
-                -- visible leaf toward its top-level ancestor, whatever
-                -- that ancestor's own visibility happens to be. Plain
-                -- UNION (not ALL): classic multiple inheritance (not
-                -- partitioning, which is single-parent) can put more
-                -- than one parent above the same leaf, which would
-                -- otherwise walk the same (leaf_oid, ancestor_oid)
-                -- pair more than once.
                 SELECT a.leaf_oid, i.inhparent
                 FROM pg_inherits i
                     JOIN ancestry a ON i.inhrelid = a.ancestor_oid
             ),
-            roots AS (
-                -- Each leaf's true top-level ancestor is the one row
-                -- where ancestor_oid has no parent of its own -- a
-                -- leaf N inheritance levels deep produces N+1 ancestry
-                -- rows (itself, then each ancestor up the chain), and
-                -- only the topmost is never itself someone's child.
-                SELECT leaf_oid, ancestor_oid AS root_oid
+            eligible_roots AS (
+                -- A root is in scope if EITHER half finds it:
+                -- visibility anywhere in its tree is enough to bring
+                -- the whole tree into scope, not just visibility at
+                -- one specific member of it. First half: the
+                -- top-level ancestor is itself visible and isn't
+                -- itself a partition/child of something else --
+                -- catches a tree every one of whose partitions
+                -- happens to live in a schema that isn't visible,
+                -- even though the root (table name administrators
+                -- actually look for) is. Second half: ancestry above
+                -- already walked up from a visible leaf to this same
+                -- root -- catches the opposite case, a tree whose
+                -- root isn't visible even though some leaf is.
+                SELECT c.oid AS root_oid
+                FROM pg_class c
+                    LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r','m','p')
+                    AND c.relpersistence != 'temporary'
+                    AND n.nspname <> 'information_schema'
+                    AND n.nspname !~ '^pg_toast'
+                    AND pg_table_is_visible(c.oid)
+                    AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
+                UNION
+                SELECT DISTINCT a.ancestor_oid AS root_oid
                 FROM ancestry a
                 WHERE NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = a.ancestor_oid)
             ),
+            descend AS (
+                -- Once a root is in scope (by either rule above),
+                -- every physical descendant under it counts toward
+                -- its size -- walk DOWN unconditionally, with no
+                -- visibility check at all: an individual partition's
+                -- own schema visibility was never what made its bytes
+                -- part of the application's data, only the tree's
+                -- eligibility as a whole was. Plain UNION for the same
+                -- double-counting reason as ancestry above.
+                SELECT root_oid, root_oid AS oid FROM eligible_roots
+                UNION
+                SELECT d.root_oid, i.inhrelid
+                FROM pg_inherits i
+                    JOIN descend d ON i.inhparent = d.oid
+            ),
             leaves AS (
-                SELECT r.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
-                FROM roots r
-                    JOIN pg_class leaf ON leaf.oid = r.leaf_oid
+                -- Only relkind 'r'/'m' descendants have storage of
+                -- their own -- a partitioned/inheritance parent
+                -- (relkind 'p') is a catalog-only placeholder with no
+                -- physical size, so it never contributes its own row
+                -- here, only its leaves'.
+                SELECT d.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
+                FROM descend d
+                    JOIN pg_class leaf ON leaf.oid = d.oid
+                WHERE leaf.relkind IN ('r','m')
             ),
             top_roots AS (
                 -- Rank by total_size and keep only the top 20 *before*
