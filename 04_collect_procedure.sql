@@ -227,11 +227,48 @@ BEGIN
         INSERT INTO hist_tables_size
         SELECT v_job_id, v_inst.instance, s.*
         FROM dblink(v_inst.fdw_server, $sql_tblsize$
-            WITH RECURSIVE partition_tree AS (
-                -- Anchor: every non-temp, visible table/materialized
-                -- view/partitioned-or-inherited parent that is not
-                -- itself a partition/child of something else.
-                SELECT c.oid, c.oid AS root_oid
+            WITH RECURSIVE ancestry AS (
+                -- Walk UP the inheritance chain (any depth) from every
+                -- non-temp, visible, storage-bearing leaf toward its
+                -- top-level ancestor, whatever that ancestor's own
+                -- visibility happens to be -- this alone would find a
+                -- tree whose root isn't itself visible even though
+                -- (at least) one leaf is, but by itself still misses a
+                -- visible root none of whose OTHER leaves happen to be
+                -- visible (see eligible_roots below for that half).
+                -- Plain UNION (not ALL): classic multiple inheritance
+                -- (not partitioning, which is single-parent) can put
+                -- more than one parent above the same leaf, which
+                -- would otherwise walk the same (leaf_oid,
+                -- ancestor_oid) pair more than once.
+                SELECT c.oid AS leaf_oid, c.oid AS ancestor_oid
+                FROM pg_class c
+                    LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r','m')
+                    AND c.relpersistence != 'temporary'
+                    AND n.nspname <> 'information_schema'
+                    AND n.nspname !~ '^pg_toast'
+                    AND pg_table_is_visible(c.oid)
+                UNION
+                SELECT a.leaf_oid, i.inhparent
+                FROM pg_inherits i
+                    JOIN ancestry a ON i.inhrelid = a.ancestor_oid
+            ),
+            eligible_roots AS (
+                -- A root is in scope if EITHER half finds it:
+                -- visibility anywhere in its tree is enough to bring
+                -- the whole tree into scope, not just visibility at
+                -- one specific member of it. First half: the
+                -- top-level ancestor is itself visible and isn't
+                -- itself a partition/child of something else --
+                -- catches a tree every one of whose partitions
+                -- happens to live in a schema that isn't visible,
+                -- even though the root (table name administrators
+                -- actually look for) is. Second half: ancestry above
+                -- already walked up from a visible leaf to this same
+                -- root -- catches the opposite case, a tree whose
+                -- root isn't visible even though some leaf is.
+                SELECT c.oid AS root_oid
                 FROM pg_class c
                     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE c.relkind IN ('r','m','p')
@@ -241,26 +278,34 @@ BEGIN
                     AND pg_table_is_visible(c.oid)
                     AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid)
                 UNION
-                -- Walk down to every partition/child, tagging each with
-                -- its top-level ancestor (root_oid), however many levels
-                -- deep -- a partitioned table is sized as one table, not
-                -- one row per partition. Plain UNION (not ALL): classic
-                -- multiple inheritance (not partitioning, which is
-                -- single-parent) can reach the same descendant via more
-                -- than one parent path, so dedupe (oid, root_oid) pairs
-                -- to avoid double-counting that descendant's size.
-                SELECT i.inhrelid, pt.root_oid
+                SELECT DISTINCT a.ancestor_oid AS root_oid
+                FROM ancestry a
+                WHERE NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = a.ancestor_oid)
+            ),
+            descend AS (
+                -- Once a root is in scope (by either rule above),
+                -- every physical descendant under it counts toward
+                -- its size -- walk DOWN unconditionally, with no
+                -- visibility check at all: an individual partition's
+                -- own schema visibility was never what made its bytes
+                -- part of the application's data, only the tree's
+                -- eligibility as a whole was. Plain UNION for the same
+                -- double-counting reason as ancestry above.
+                SELECT root_oid, root_oid AS oid FROM eligible_roots
+                UNION
+                SELECT d.root_oid, i.inhrelid
                 FROM pg_inherits i
-                    JOIN partition_tree pt ON i.inhparent = pt.oid
+                    JOIN descend d ON i.inhparent = d.oid
             ),
             leaves AS (
-                -- Only relkind 'r'/'m' leaves have storage of their own
-                -- -- a partitioned/inheritance parent (relkind 'p') is a
-                -- catalog-only placeholder with no physical size, so it
-                -- never contributes its own row here, only its leaves'.
-                SELECT pt.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
-                FROM partition_tree pt
-                    JOIN pg_class leaf ON leaf.oid = pt.oid
+                -- Only relkind 'r'/'m' descendants have storage of
+                -- their own -- a partitioned/inheritance parent
+                -- (relkind 'p') is a catalog-only placeholder with no
+                -- physical size, so it never contributes its own row
+                -- here, only its leaves'.
+                SELECT d.root_oid, leaf.oid AS leaf_oid, leaf.reltoastrelid, leaf.reltuples
+                FROM descend d
+                    JOIN pg_class leaf ON leaf.oid = d.oid
                 WHERE leaf.relkind IN ('r','m')
             ),
             top_roots AS (
@@ -303,7 +348,8 @@ BEGIN
                 CASE WHEN bool_or(l.reltuples < 0) THEN NULL ELSE sum(l.reltuples) END AS rows,
                 CASE WHEN bool_or(l.reltuples < 0) THEN NULL
                     ELSE trunc(sum(pg_table_size(l.leaf_oid)) / nullif(sum(l.reltuples),0))::numeric
-                END AS avg_row_size
+                END AS avg_row_size,
+                true AS is_rollup
             FROM top_roots tr
                 JOIN leaves l ON l.root_oid = tr.root_oid
                 JOIN pg_class c ON c.oid = tr.root_oid
@@ -316,7 +362,7 @@ BEGIN
             tablespace text, schema name, name name, type text, persistence text,
             owner name, total_size bigint, index_size bigint, index_size_pct numeric,
             heap_size bigint, heap_size_pct numeric, toast_size bigint,
-            toast_size_pct numeric, rows real, avg_row_size numeric
+            toast_size_pct numeric, rows real, avg_row_size numeric, is_rollup boolean
         );
 
         INSERT INTO hist_index_poor

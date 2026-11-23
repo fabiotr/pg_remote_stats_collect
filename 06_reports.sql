@@ -137,12 +137,21 @@ history AS (
         h.toast_size,
         h.toast_size_pct,
         h.rows,
-        h.avg_row_size
+        h.avg_row_size,
+        h.is_rollup
     FROM hist_tables_size h
         JOIN stat_collect_job j ON j.id = h.id_stat_collect_job AND j.instance = h.instance
         JOIN top_tables t ON t.instance = h.instance AND t.schema = h.schema AND t.name = h.name
 ),
 with_growth AS (
+    -- is_rollup is part of the partition key, not just a passthrough
+    -- column: 0.4.3 made total_size mean "whole partition/inheritance
+    -- subtree" instead of "this one relation", for any table that
+    -- turns out to be a rollup root -- under the same (instance,
+    -- schema, name), so the first rollup-scoped row would otherwise
+    -- show a one-time jump that lag()/first_value() would read as
+    -- real growth. Splitting the window by is_rollup makes that first
+    -- row start a new series (prev/first values NULL) instead.
     SELECT
         history.*,
         lag(total_size) OVER w_seq             AS prev_total_size,
@@ -153,8 +162,8 @@ with_growth AS (
         last_value(collect_date) OVER w_full   AS last_collect_date
     FROM history
     WINDOW
-        w_seq AS (PARTITION BY instance, schema, name ORDER BY collect_date),
-        w_full AS (PARTITION BY instance, schema, name ORDER BY collect_date
+        w_seq AS (PARTITION BY instance, schema, name, is_rollup ORDER BY collect_date),
+        w_full AS (PARTITION BY instance, schema, name, is_rollup ORDER BY collect_date
                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
 )
 SELECT
@@ -186,7 +195,8 @@ SELECT
     round(
         (last_total_size - first_total_size) * 100.0 / nullif(first_total_size, 0)
             / nullif(last_collect_date - first_collect_date, 0) * 365
-    , 2) AS year_growth_pct
+    , 2) AS year_growth_pct,
+    is_rollup
 FROM with_growth
 ORDER BY collect_date DESC, instance, total_size DESC;
 
@@ -212,7 +222,8 @@ SELECT
     lpad(pg_size_pretty(round(month_growth_bytes)::bigint), 8) AS month_growth_bytes,
     month_growth_pct,
     lpad(pg_size_pretty(round(year_growth_bytes)::bigint), 8) AS year_growth_bytes,
-    year_growth_pct
+    year_growth_pct,
+    is_rollup
 FROM rpt_tables_size_history_raw;
 
 -- ---------------------------------------------------------------------
