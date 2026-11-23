@@ -229,28 +229,32 @@ BEGIN
         FROM dblink(v_inst.fdw_server, $sql_tblsize$
             WITH RECURSIVE ancestry AS (
                 -- Walk UP the inheritance chain (any depth) from every
-                -- non-temp, visible, storage-bearing leaf toward its
-                -- top-level ancestor, whatever that ancestor's own
-                -- visibility happens to be -- this alone would find a
-                -- tree whose root isn't itself visible even though
-                -- (at least) one leaf is, but by itself still misses a
-                -- visible root none of whose OTHER leaves happen to be
-                -- visible (see eligible_roots below for that half).
-                -- Plain UNION (not ALL): classic multiple inheritance
-                -- (not partitioning, which is single-parent) can put
-                -- more than one parent above the same leaf, which
-                -- would otherwise walk the same (leaf_oid,
+                -- non-temp, visible table/materialized view/
+                -- partitioned-or-inherited parent toward its top-level
+                -- ancestor, whatever that ancestor's own visibility
+                -- happens to be. Includes 'p' (not just the 'r'/'m'
+                -- that actually have storage): an intermediate
+                -- partitioned table in a multi-level tree can be the
+                -- ONLY visible member of that tree (its own parent and
+                -- every physical leaf under it both invisible), and
+                -- excluding it here would make eligible_roots' second
+                -- branch below never discover that tree at all, same
+                -- as not walking up from it in the first place. Plain
+                -- UNION (not ALL): classic multiple inheritance (not
+                -- partitioning, which is single-parent) can put more
+                -- than one parent above the same starting point, which
+                -- would otherwise walk the same (start_oid,
                 -- ancestor_oid) pair more than once.
-                SELECT c.oid AS leaf_oid, c.oid AS ancestor_oid
+                SELECT c.oid AS start_oid, c.oid AS ancestor_oid
                 FROM pg_class c
                     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r','m')
+                WHERE c.relkind IN ('r','m','p')
                     AND c.relpersistence != 'temporary'
                     AND n.nspname <> 'information_schema'
                     AND n.nspname !~ '^pg_toast'
                     AND pg_table_is_visible(c.oid)
                 UNION
-                SELECT a.leaf_oid, i.inhparent
+                SELECT a.start_oid, i.inhparent
                 FROM pg_inherits i
                     JOIN ancestry a ON i.inhrelid = a.ancestor_oid
             ),
@@ -265,9 +269,11 @@ BEGIN
                 -- happens to live in a schema that isn't visible,
                 -- even though the root (table name administrators
                 -- actually look for) is. Second half: ancestry above
-                -- already walked up from a visible leaf to this same
-                -- root -- catches the opposite case, a tree whose
-                -- root isn't visible even though some leaf is.
+                -- already walked up from SOME visible member of the
+                -- tree (a physical leaf or an intermediate partitioned
+                -- table) to this same root -- catches a tree whose
+                -- root isn't visible even though something under it
+                -- is.
                 SELECT c.oid AS root_oid
                 FROM pg_class c
                     LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
